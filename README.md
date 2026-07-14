@@ -51,16 +51,18 @@ Driver={ODBC Driver 18 for SQL Server};Server=VMWinSQLS,1433;Database=Prohance;U
 
 ## Run
 
+From the project root (the folder that contains `chat.py`, `app\`, and `requirements.txt`):
+
 ```bat
-python chat.pyw
+dir
+python -m pip install -r requirements.txt
+python chat.py
 ```
+
+Or double-click `run.bat`.
 
 This starts Flask at `http://127.0.0.1:5000/` and opens your browser.  
-`.pyw` hides the console on Windows. To see startup errors, run:
-
-```bat
-python -c "exec(open('chat.pyw', encoding='utf-8').read())"
-```
+`python chat.pyw` also works and hides the console on Windows.
 
 ## How it works
 
