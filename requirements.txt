@@ -1,0 +1,4 @@
+flask>=3.0,<4
+pyodbc>=5.1,<6
+openai>=1.40,<2
+pytest>=8.0,<9

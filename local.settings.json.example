@@ -1,0 +1,11 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "SqlServerHost": "VMWinSQLS",
+    "SqlConnectionString": "Driver={ODBC Driver 18 for SQL Server};Server=VMWinSQLS,1433;Database=Prohance;Trusted_Connection=yes;TrustServerCertificate=yes;Encrypt=no;",
+    "OpenAIApiKey": "sk-your-key-here",
+    "OpenAIModel": "gpt-4o-mini",
+    "FLASK_HOST": "127.0.0.1",
+    "FLASK_PORT": "5000"
+  }
+}

@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Prohance Chat</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&family=Source+Sans+3:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}" />
+  </head>
+  <body>
+    <div class="atmosphere" aria-hidden="true"></div>
+    <main class="shell">
+      <header class="brand">
+        <p class="brand-mark">Prohance</p>
+        <h1>Ask your SQL Server</h1>
+        <p class="lede">
+          Natural-language questions against the Prohance database on
+          <span id="server-label">VMWinSQLS</span>.
+        </p>
+        <p id="status" class="status" role="status">Checking connection…</p>
+      </header>
+
+      <section class="chat" aria-label="Chat">
+        <div id="messages" class="messages"></div>
+        <form id="chat-form" class="composer" autocomplete="off">
+          <label class="sr-only" for="message">Your question</label>
+          <textarea
+            id="message"
+            name="message"
+            rows="2"
+            placeholder="e.g. How many users are in the database?"
+            required
+          ></textarea>
+          <button type="submit" id="send">Ask</button>
+        </form>
+      </section>
+    </main>
+    <script src="{{ url_for('static', filename='js/chat.js') }}"></script>
+  </body>
+</html>
