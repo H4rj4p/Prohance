@@ -1,0 +1,1119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>IRI AI</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f7f7f8;
+      color: #111827;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    header {
+      padding: 14px 20px;
+      border-bottom: 1px solid #d1d5db;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      background: #ffffff;
+    }
+    header h1 { font-size: 1rem; font-weight: 600; }
+    #status {
+      font-size: 0.8rem;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: #e5e7eb;
+      color: #374151;
+    }
+    #status.ok { background: #dcfce7; color: #166534; }
+    #status.bad { background: #fee2e2; color: #991b1b; }
+    #messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 24px 0 120px;
+    }
+    .row {
+      max-width: min(1120px, calc(100vw - 40px));
+      margin: 0 auto 18px;
+      padding: 0 20px;
+      display: flex;
+      gap: 14px;
+    }
+    .avatar {
+      width: 30px;
+      height: 30px;
+      border-radius: 4px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 0.75rem;
+      font-weight: 700;
+      flex-shrink: 0;
+    }
+    .row.user .avatar { background: #2563eb; color: #ffffff; }
+    .row.bot .avatar { background: #10b981; color: #ffffff; }
+    .bubble {
+      line-height: 1.55;
+      white-space: pre-wrap;
+      padding-top: 4px;
+      flex: 1;
+      min-width: 0;
+    }
+    .meta {
+      margin-top: 10px;
+      font-size: 0.75rem;
+      color: #6b7280;
+    }
+    .sql-query {
+      margin-top: 10px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.72rem;
+      color: #111827;
+      background: #f3f4f6;
+      border: 1px solid #d1d5db;
+      border-radius: 4px;
+      padding: 6px 8px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .sql-label {
+      font-size: 0.68rem;
+      color: #6b7280;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      margin-bottom: 4px;
+    }
+    .data-table-wrap {
+      margin-top: 10px;
+      display: inline-block;
+      max-width: 100%;
+      overflow-x: auto;
+      border: 1px solid #d1d5db;
+      border-radius: 2px;
+      background: #ffffff;
+    }
+    .data-table {
+      border-collapse: collapse;
+      font-size: 0.78rem;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .data-table th,
+    .data-table td {
+      padding: 2px 8px;
+      text-align: left;
+      border: 1px solid #d1d5db;
+      white-space: nowrap;
+      line-height: 1.35;
+    }
+    .data-table th {
+      background: #f3f4f6;
+      color: #374151;
+      font-size: 0.72rem;
+      font-weight: 600;
+    }
+    .data-table tbody tr:hover td {
+      background: #f9fafb;
+    }
+    .confirm-names {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 10px;
+    }
+    .name-pick {
+      background: #ffffff;
+      color: #111827;
+      border: 1px solid #d1d5db;
+      border-radius: 6px;
+      padding: 5px 10px;
+      font-size: 0.78rem;
+      font-weight: 500;
+      cursor: pointer;
+    }
+    .name-pick:hover {
+      background: #2563eb;
+      border-color: #2563eb;
+      color: #ffffff;
+    }
+    .composer-wrap {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      background: linear-gradient(transparent, #f7f7f8 30%);
+      padding: 16px 20px 24px;
+    }
+    .composer {
+      max-width: 780px;
+      margin: 0 auto;
+      display: flex;
+      gap: 10px;
+      background: #ffffff;
+      border: 1px solid #d1d5db;
+      border-radius: 14px;
+      padding: 10px 12px;
+    }
+    textarea {
+      flex: 1;
+      resize: none;
+      border: none;
+      background: transparent;
+      color: #111827;
+      font: inherit;
+      outline: none;
+      min-height: 24px;
+      max-height: 160px;
+      overflow-y: auto;
+    }
+    button {
+      border: none;
+      background: #2563eb;
+      color: #ffffff;
+      font-weight: 600;
+      border-radius: 10px;
+      padding: 0 16px;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .hint {
+      max-width: 780px;
+      margin: 0 auto 8px;
+      font-size: 0.8rem;
+      color: #6b7280;
+      text-align: center;
+    }
+    .chart-wrap {
+      margin-top: 12px;
+      padding: 12px;
+      background: #ffffff;
+      border: 1px solid #d1d5db;
+      border-radius: 6px;
+      max-width: 100%;
+    }
+    .chart-wrap.hidden { display: none; }
+    .chart-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 8px;
+    }
+    .chart-label {
+      font-size: 0.68rem;
+      color: #6b7280;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .chart-canvas-wrap {
+      position: relative;
+      height: 360px;
+      max-width: 820px;
+    }
+    .chart-canvas-wrap.hidden { display: none; }
+    .result-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 12px;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .chart-type-actions,
+    .export-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .primary-actions { justify-content: flex-start; }
+    .chart-options { justify-content: center; }
+    .export-actions { justify-content: flex-end; }
+    .closed-chart-actions.hidden { display: none; }
+    .chart-type-actions.hidden { display: none; }
+    .data-table-wrap {
+      max-height: 320px;
+      overflow: auto;
+      width: fit-content;
+      max-width: 100%;
+    }
+    .data-table-wrap.hidden { display: none; }
+    .table-footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-top: 8px;
+      max-width: 100%;
+    }
+    .table-count {
+      color: #6b7280;
+      font-size: 0.78rem;
+    }
+    .table-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      justify-content: flex-end;
+    }
+    .mini-btn {
+      background: #ffffff;
+      color: #111827;
+      border: 1px solid #d1d5db;
+      border-radius: 999px;
+      padding: 5px 10px;
+      font-size: 0.75rem;
+      font-weight: 600;
+    }
+    .mini-btn:hover,
+    .mini-btn.active {
+      background: #2563eb;
+      border-color: #2563eb;
+      color: #ffffff;
+    }
+    .mini-btn.secondary:hover {
+      background: #f3f4f6;
+      color: #111827;
+      border-color: #9ca3af;
+    }
+    details.result-details {
+      margin-top: 10px;
+      font-size: 0.78rem;
+      color: #374151;
+    }
+    details.result-details summary {
+      cursor: pointer;
+      color: #2563eb;
+      font-weight: 600;
+      list-style-position: inside;
+    }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <header>
+    <h1>IRI AI</h1>
+    <span id="status">Checking database...</span>
+  </header>
+
+  <div id="messages">
+    <div class="row bot">
+      <div class="avatar">AI</div>
+      <div class="bubble" id="welcome">
+        Hi! I'm IRI AI. Ask questions about your connected database in plain English, and I'll answer in plain English too.
+        <div class="meta">Example: "How many rows are in customers?" — use your real table names from /api/GetDatabaseSchema</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="composer-wrap">
+    <div class="hint">Press Enter to send, Shift+Enter for a new line</div>
+    <div class="composer">
+      <textarea id="input" rows="1" placeholder="Ask a question about your data..."></textarea>
+      <button id="send">Send</button>
+    </div>
+  </div>
+
+  <script>
+    const messages = document.getElementById("messages");
+    const input = document.getElementById("input");
+    const send = document.getElementById("send");
+    const status = document.getElementById("status");
+    const base = window.location.origin;
+    const chatHistory = [];
+    let lastUserQuestion = "";
+    let chartCounter = 0;
+    let lastResultContext = null;
+
+    const CHART_COLORS = [
+      "#19c37d", "#5436da", "#3b82f6", "#f59e0b", "#ef4444",
+      "#8b5cf6", "#14b8a6", "#ec4899", "#84cc16", "#06b6d4"
+    ];
+    const ID_COLS = new Set(["customerid", "rownumber", "id"]);
+    const TABLE_PAGE_SIZE = 100;
+    const PREFERRED_LABELS = ["surname", "geography", "gender", "customername", "name"];
+    const PREFERRED_VALUES = [
+      "estimatedsalary", "salary", "balance", "creditscore", "age",
+      "count", "total", "average", "avg", "male", "female"
+    ];
+    const chartInstances = new Map();
+
+    function looksLikeJson(text) {
+      if (!text) return false;
+      const trimmed = text.trim();
+      return trimmed.startsWith("{") || trimmed.startsWith("[");
+    }
+
+    function friendlyError(data) {
+      const answer = data.answer && !looksLikeJson(data.answer)
+        ? data.answer
+        : "Something went wrong.";
+      if (!data.error || looksLikeJson(data.error)) return answer;
+      return `${answer}\n\n${data.error}`;
+    }
+
+    async function checkStatus() {
+      try {
+        const res = await fetch(`${base}/api/TestSqlConnection`);
+        const data = await res.json();
+        if (data.success) {
+          status.textContent = `Connected: ${data.database}`;
+          status.className = "ok";
+          const welcome = document.getElementById("welcome");
+          if (welcome) {
+            welcome.innerHTML = `Hi! I'm IRI AI. You're connected to <strong>${escapeHtml(data.database)}</strong>. Ask anything about your data in plain English.`;
+          }
+        } else {
+          status.textContent = "DB not connected";
+          status.className = "bad";
+          addBot(`The database isn't connected yet.\n\n${data.error || data.message}\n\nFor SQL Server on Windows, set SqlConnectionString in local.settings.json with your SQL Server name, database, and authentication details.`);
+        }
+      } catch {
+        status.textContent = "App not running";
+        status.className = "bad";
+        addBot("The app isn't running. Start it with: python app.pyw");
+      }
+    }
+
+    function addRow(role, text, meta) {
+      const row = document.createElement("div");
+      row.className = `row ${role}`;
+      row.innerHTML = `
+        <div class="avatar">${role === "user" ? "You" : "AI"}</div>
+        <div class="bubble">${escapeHtml(text)}${meta ? `<div class="meta">${escapeHtml(meta)}</div>` : ""}</div>
+      `;
+      messages.appendChild(row);
+      messages.scrollTop = messages.scrollHeight;
+    }
+
+    function formatColumnLabel(name) {
+      return name
+        .replace(/([a-z])([A-Z])/g, "$1 $2")
+        .replace(/_/g, " ");
+    }
+
+    function formatCellValue(value) {
+      if (value === null || value === undefined) return "";
+      if (typeof value === "boolean") return value ? "Yes" : "No";
+      return String(value);
+    }
+
+    function formatChartValue(value) {
+      const number = Number(value);
+      if (!Number.isFinite(number)) return formatCellValue(value);
+      return new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 }).format(number);
+    }
+
+    function isNumericValue(value) {
+      if (value === null || value === undefined || typeof value === "boolean") return false;
+      if (typeof value === "number") return !Number.isNaN(value);
+      const n = Number(value);
+      return !Number.isNaN(n);
+    }
+
+    function getNumericColumns(row) {
+      return Object.keys(row).filter(key => {
+        if (ID_COLS.has(key.toLowerCase())) return false;
+        return isNumericValue(row[key]);
+      });
+    }
+
+    function scoreColumnName(name, preferred) {
+      const normalized = name.toLowerCase().replace(/[^a-z0-9]/g, "");
+      const exactIndex = preferred.indexOf(normalized);
+      if (exactIndex >= 0) return 100 - exactIndex;
+
+      const containsIndex = preferred.findIndex(pref => normalized.includes(pref));
+      return containsIndex >= 0 ? 50 - containsIndex : 0;
+    }
+
+    function getLabelColumn(rows, valueCol) {
+      const row = rows[0];
+      const keys = Object.keys(row).filter(key => key !== valueCol && !ID_COLS.has(key.toLowerCase()));
+      for (const pref of PREFERRED_LABELS) {
+        const found = keys.find(k => k.toLowerCase() === pref);
+        if (found) return found;
+      }
+
+      const stringCols = keys.filter(k => rows.some(r => typeof r[k] === "string" && r[k] !== ""));
+      if (stringCols.length > 0) {
+        return stringCols
+          .map(col => ({ col, score: scoreColumnName(col, PREFERRED_LABELS) }))
+          .sort((a, b) => b.score - a.score)[0].col;
+      }
+
+      return keys[0] || null;
+    }
+
+    function getValueColumn(rows, labelCol) {
+      const numericCols = getNumericColumns(rows[0]).filter(col => col !== labelCol);
+      if (numericCols.length === 0) return null;
+
+      return numericCols
+        .map(col => ({
+          col,
+          score: scoreColumnName(col, PREFERRED_VALUES)
+        }))
+        .sort((a, b) => b.score - a.score)[0].col;
+    }
+
+    function userWantsChart(question) {
+      return /\b(graph|graphs|chart|charts|plot|plots|visual|visuali[sz]e|diagram|pie\s*chart|bar\s*chart|line\s*chart|show\s+me\s+a\s+(graph|chart|plot))\b/i
+        .test(question || "");
+    }
+
+    function requestedChartType(question) {
+      const text = question || "";
+      if (/\bpie(\s+chart)?\b/i.test(text)) return "pie";
+      if (/\bline(\s+chart|\s+graph)?\b/i.test(text)) return "line";
+      if (/\bbar(\s+chart|\s+graph)?\b/i.test(text)) return "bar";
+      return null;
+    }
+
+    function resolveChartType(rows, chartType, question) {
+      const requested = requestedChartType(question);
+      if (!requested && !userWantsChart(question)) return null;
+      if (!rows || rows.length === 0) return null;
+
+      if (requested) return requested;
+
+      if (chartType && chartType !== "table") return chartType;
+
+      if (rows.length === 1 && getNumericColumns(rows[0]).length >= 2) return "bar";
+      if (rows.length >= 2 && rows.length <= 25 && getLabelColumn(rows) && getNumericColumns(rows[0]).length > 0) {
+        const label = getLabelColumn(rows).toLowerCase();
+        if (rows.length <= 6 && (label === "gender" || label === "geography")) return "pie";
+        return "bar";
+      }
+
+      return null;
+    }
+
+    function buildChartSpec(rows, chartType) {
+      if (!rows || rows.length === 0) return null;
+
+      if (rows.length === 1) {
+        const nums = getNumericColumns(rows[0]);
+        if (nums.length < 2) return null;
+        return {
+          type: chartType === "pie" ? "pie" : "bar",
+          labels: nums.map(formatColumnLabel),
+          values: nums.map(c => Number(rows[0][c])),
+          datasetLabel: "Values",
+          xAxisLabel: "Metric",
+          yAxisLabel: "Value"
+        };
+      }
+
+      const valueCol = getValueColumn(rows);
+      const labelCol = getLabelColumn(rows, valueCol);
+      if (!labelCol || !valueCol) return null;
+
+      const labels = rows.map(r => formatCellValue(r[labelCol]));
+      const values = rows.map(r => Number(r[valueCol]));
+
+      let type = chartType;
+      if (type === "line" && labels.length < 3) type = "bar";
+
+      return {
+        type: type === "pie" ? "pie" : (type === "line" ? "line" : "bar"),
+        labels,
+        values,
+        datasetLabel: formatColumnLabel(valueCol),
+        xAxisLabel: formatColumnLabel(labelCol),
+        yAxisLabel: formatColumnLabel(valueCol)
+      };
+    }
+
+    function renderChartCanvas(chartId, isVisible, actionHtml) {
+      return `
+        <div class="chart-wrap${isVisible ? "" : " hidden"}">
+          <div class="chart-header">
+            <div class="chart-label">${isVisible ? "Chart" : "Visualization"}</div>
+          </div>
+          <div class="chart-canvas-wrap${isVisible ? "" : " hidden"}">
+            <canvas id="${chartId}"></canvas>
+          </div>
+          ${actionHtml || ""}
+        </div>
+      `;
+    }
+
+    function mountChart(canvasId, spec) {
+      if (!spec || typeof Chart === "undefined") return;
+
+      const canvas = document.getElementById(canvasId);
+      if (!canvas) return;
+
+      const existing = chartInstances.get(canvasId);
+      if (existing) existing.destroy();
+
+      const colors = spec.labels.map((_, i) => CHART_COLORS[i % CHART_COLORS.length]);
+
+      const barValueLabels = {
+        id: "barValueLabels",
+        afterDatasetsDraw(chart) {
+          if (chart.config.type !== "bar") return;
+
+          const { ctx } = chart;
+          ctx.save();
+          ctx.fillStyle = "#111827";
+          ctx.font = "600 10px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
+          ctx.textAlign = "center";
+          ctx.textBaseline = "bottom";
+
+          chart.data.datasets.forEach((dataset, datasetIndex) => {
+            const meta = chart.getDatasetMeta(datasetIndex);
+            meta.data.forEach((bar, index) => {
+              const value = dataset.data[index];
+              if (value === null || value === undefined || Number.isNaN(Number(value))) return;
+              ctx.fillText(formatChartValue(value), bar.x, bar.y - 4);
+            });
+          });
+
+          ctx.restore();
+        }
+      };
+
+      const commonOptions = {
+        responsive: true,
+        maintainAspectRatio: false,
+        layout: {
+          padding: { top: 18 }
+        },
+        plugins: {
+          legend: {
+            labels: { color: "#111827", font: { size: 11 } }
+          }
+        }
+      };
+
+      if (spec.type === "pie") {
+        const chart = new Chart(canvas, {
+          type: "pie",
+          data: {
+            labels: spec.labels,
+            datasets: [{
+              data: spec.values,
+              backgroundColor: colors,
+              borderColor: "#ffffff",
+              borderWidth: 1
+            }]
+          },
+          options: commonOptions
+        });
+        chartInstances.set(canvasId, chart);
+        return;
+      }
+
+      const isLine = spec.type === "line";
+      const chart = new Chart(canvas, {
+        type: isLine ? "line" : "bar",
+        data: {
+          labels: spec.labels,
+          datasets: [{
+            label: spec.datasetLabel,
+            data: spec.values,
+            backgroundColor: isLine ? "rgba(25, 195, 125, 0.2)" : colors,
+            borderColor: isLine ? "#19c37d" : colors,
+            borderWidth: isLine ? 2 : 1,
+            fill: isLine,
+            tension: 0.25
+          }]
+        },
+        options: {
+          ...commonOptions,
+          scales: {
+            x: {
+              ticks: { color: "#374151", font: { size: 10 } },
+              grid: { color: "rgba(156, 163, 175, 0.35)" },
+              title: {
+                display: true,
+                text: spec.xAxisLabel || "Category",
+                color: "#111827",
+                font: { size: 12, weight: "600" }
+              }
+            },
+            y: {
+              ticks: { color: "#374151", font: { size: 10 } },
+              grid: { color: "rgba(156, 163, 175, 0.35)" },
+              title: {
+                display: true,
+                text: spec.yAxisLabel || spec.datasetLabel || "Value",
+                color: "#111827",
+                font: { size: 12, weight: "600" }
+              },
+              beginAtZero: true
+            }
+          }
+        },
+        plugins: isLine ? [] : [barValueLabels]
+      });
+      chartInstances.set(canvasId, chart);
+    }
+
+    function renderTableRows(rows, columns, visibleCount) {
+      return rows.slice(0, visibleCount).map(row => {
+        const cells = columns.map(col =>
+          `<td>${escapeHtml(formatCellValue(row[col]))}</td>`
+        ).join("");
+        return `<tr>${cells}</tr>`;
+      }).join("");
+    }
+
+    function renderDataView(rows, isHidden = false) {
+      if (!rows || rows.length === 0) return "";
+
+      const columns = Object.keys(rows[0]);
+      if (columns.length === 0) return "";
+
+      const header = columns.map(col =>
+        `<th>${escapeHtml(formatColumnLabel(col))}</th>`
+      ).join("");
+
+      const visibleCount = Math.min(TABLE_PAGE_SIZE, rows.length);
+      const body = renderTableRows(rows, columns, visibleCount);
+      const loadMoreHtml = rows.length > visibleCount
+        ? `<button type="button" class="mini-btn" data-action="load-more">Load more</button>`
+        : "";
+
+      return `
+        <div class="table-result${isHidden ? " hidden" : ""}" data-visible-count="${visibleCount}">
+          <div class="data-table-wrap">
+            <table class="data-table">
+              <thead><tr>${header}</tr></thead>
+              <tbody>${body}</tbody>
+            </table>
+          </div>
+          <div class="table-footer">
+            <span class="table-count">Showing ${visibleCount} of ${rows.length} rows</span>
+            <div class="table-actions">
+              ${loadMoreHtml}
+              <button type="button" class="mini-btn secondary" data-action="csv">Export CSV</button>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    function renderClosedChartToggle(chartId, rows) {
+      if (!rows || rows.length === 0) return "";
+
+      return `
+        <div class="result-actions closed-chart-actions" data-chart-id="${escapeAttr(chartId || "")}">
+          <div class="chart-type-actions primary-actions">
+            <button type="button" class="mini-btn" data-action="toggle-chart">Show charts</button>
+          </div>
+        </div>
+      `;
+    }
+
+    function renderChartFooter(chartId, activeType, rows) {
+      if (!rows || rows.length === 0) return "";
+
+      const chartTypes = ["bar", "line", "pie"];
+      const chartButtons = chartTypes.map(type => `
+        <button type="button" class="mini-btn chart-type ${activeType === type ? "active" : ""}"
+          data-action="chart" data-chart-type="${type}">
+          ${type[0].toUpperCase() + type.slice(1)}
+        </button>
+      `).join("");
+
+      return `
+        <div class="result-actions" data-chart-id="${escapeAttr(chartId || "")}">
+          <div class="chart-type-actions primary-actions">
+            <button type="button" class="mini-btn active" data-action="toggle-chart">Hide charts</button>
+          </div>
+          <div class="chart-type-actions chart-options">
+            ${chartButtons}
+          </div>
+        </div>
+      `;
+    }
+
+    function renderDetails(query, rows) {
+      if ((!query || query === "NA") && (!rows || rows.length === 0)) return "";
+
+      const columns = rows && rows.length > 0 ? Object.keys(rows[0]) : [];
+      const rowCount = rows ? rows.length : 0;
+      const queryHtml = query && query !== "NA"
+        ? `<div class="sql-query"><div class="sql-label">SQL query</div>${escapeHtml(query)}</div>`
+        : "";
+      const columnHtml = columns.length > 0
+        ? `<div class="meta">Rows shown: ${rowCount}<br>Columns: ${escapeHtml(columns.join(", "))}</div>`
+        : "";
+
+      return `
+        <details class="result-details">
+          <summary>SQL query details</summary>
+          ${columnHtml}
+          ${queryHtml}
+        </details>
+      `;
+    }
+
+    function setActiveChartButton(row, chartType) {
+      row.querySelectorAll(".chart-type").forEach(btn => {
+        const isActive = chartType
+          ? btn.dataset.chartType === chartType
+          : btn.dataset.action === "table";
+        btn.classList.toggle("active", isActive);
+      });
+    }
+
+    function showChart(row, chartId, rows, chartType) {
+      const spec = buildChartSpec(rows, chartType);
+      const wrap = row.querySelector(".chart-canvas-wrap");
+      if (!spec || !wrap) return false;
+
+      const chartWrap = row.querySelector(".chart-wrap");
+      if (chartWrap) chartWrap.classList.remove("hidden");
+      wrap.classList.remove("hidden");
+      const closedActions = row.querySelector(".closed-chart-actions");
+      if (closedActions) closedActions.classList.add("hidden");
+      mountChart(chartId, spec);
+      setActiveChartButton(row, spec.type);
+      return spec;
+    }
+
+    function hideChart(row, chartId) {
+      const existing = chartInstances.get(chartId);
+      if (existing) {
+        existing.destroy();
+        chartInstances.delete(chartId);
+      }
+      const wrap = row.querySelector(".chart-canvas-wrap");
+      if (wrap) wrap.classList.add("hidden");
+      const chartWrap = row.querySelector(".chart-wrap");
+      if (chartWrap) chartWrap.classList.add("hidden");
+      const closedActions = row.querySelector(".closed-chart-actions");
+      if (closedActions) closedActions.classList.remove("hidden");
+      const table = row.querySelector(".table-result");
+      if (table) table.classList.remove("hidden");
+      setActiveChartButton(row, null);
+    }
+
+    function downloadFile(filename, content, type) {
+      const blob = new Blob([content], { type });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    }
+
+    function exportRowsAsCsv(rows) {
+      if (!rows || rows.length === 0) return;
+
+      const columns = Object.keys(rows[0]);
+      const escapeCsv = value => {
+        const text = formatCellValue(value);
+        return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+      };
+      const lines = [
+        columns.map(escapeCsv).join(","),
+        ...rows.map(row => columns.map(col => escapeCsv(row[col])).join(","))
+      ];
+
+      downloadFile("iri-ai-results.csv", lines.join("\n"), "text/csv;charset=utf-8");
+    }
+
+    function loadMoreRows(row, rows) {
+      const tableResult = row.querySelector(".table-result");
+      const tbody = tableResult?.querySelector("tbody");
+      const countEl = tableResult?.querySelector(".table-count");
+      const button = tableResult?.querySelector('[data-action="load-more"]');
+      if (!tableResult || !tbody || !countEl) return;
+
+      const columns = rows && rows.length > 0 ? Object.keys(rows[0]) : [];
+      const current = Number(tableResult.dataset.visibleCount || "0");
+      const next = Math.min(current + TABLE_PAGE_SIZE, rows.length);
+      tbody.innerHTML = renderTableRows(rows, columns, next);
+      tableResult.dataset.visibleCount = String(next);
+      countEl.textContent = `Showing ${next} of ${rows.length} rows`;
+
+      if (button && next >= rows.length) {
+        button.remove();
+      }
+    }
+
+    function renderConfirmButtons(candidates, originalQuestion) {
+      if (!candidates || candidates.length === 0) return "";
+      const buttons = candidates.map(candidate => {
+        const surname = typeof candidate === "string" ? candidate : candidate.surname;
+        const customerId = typeof candidate === "string" ? "" : candidate.customer_id;
+        const label = customerId
+          ? `${surname} (ID: ${customerId})`
+          : surname;
+        return `
+          <button type="button" class="name-pick"
+            data-surname="${escapeAttr(surname)}"
+            data-customer-id="${escapeAttr(customerId ?? "")}"
+            data-question="${escapeAttr(originalQuestion)}">
+            ${escapeHtml(label)}
+          </button>
+        `;
+      }).join("");
+      return `<div class="confirm-names">${buttons}</div>`;
+    }
+
+    function buildResultMemory(rows, query, question, chartType) {
+      const safeRows = rows || [];
+      const columns = safeRows.length > 0 ? Object.keys(safeRows[0]) : [];
+      const valueCol = safeRows.length > 0 ? getValueColumn(safeRows) : null;
+      const labelCol = safeRows.length > 0 ? getLabelColumn(safeRows, valueCol) : null;
+      const numericCols = safeRows.length > 0 ? getNumericColumns(safeRows[0]) : [];
+
+      const customerIdCol = columns.find(col => col.toLowerCase() === "customerid");
+      const surnameCol = columns.find(col => col.toLowerCase() === "surname");
+      const people = safeRows.slice(0, 20)
+        .map(row => ({
+          customer_id: customerIdCol ? row[customerIdCol] : null,
+          surname: surnameCol ? row[surnameCol] : null
+        }))
+        .filter(person => person.customer_id !== null || person.surname);
+
+      return {
+        question,
+        query,
+        chart_type: chartType || "table",
+        memory: {
+          people,
+          columns,
+          numeric_columns: numericCols,
+          label_column: labelCol,
+          value_column: valueCol,
+          row_count: safeRows.length
+        }
+      };
+    }
+
+    function addBotResponse(answer, rows, query, options = {}) {
+      const row = document.createElement("div");
+      row.className = "row bot";
+      const confirmHtml = options.needsConfirmation
+        ? renderConfirmButtons(options.candidates, options.originalQuestion)
+        : "";
+
+      const resolvedChartType = options.needsConfirmation
+        ? null
+        : resolveChartType(rows, options.chartType, options.question || options.originalQuestion || "");
+      const chartSpec = resolvedChartType ? buildChartSpec(rows, resolvedChartType) : null;
+      const chartId = rows && rows.length > 0 ? `chart-${++chartCounter}` : null;
+      const closedActionHtml = chartId ? renderClosedChartToggle(chartId, rows) : "";
+      const chartFooterHtml = chartId ? renderChartFooter(chartId, chartSpec?.type || null, rows) : "";
+      const chartHtml = chartId ? renderChartCanvas(chartId, false, chartFooterHtml) : "";
+      const tableHtml = renderDataView(rows, false);
+      const detailsHtml = renderDetails(query, rows);
+
+      row.innerHTML = `
+        <div class="avatar">AI</div>
+        <div class="bubble">
+          <div>${escapeHtml(answer)}</div>
+          ${confirmHtml}
+          ${tableHtml}
+          ${closedActionHtml}
+          ${chartHtml}
+          ${detailsHtml}
+        </div>
+      `;
+
+      row.querySelectorAll(".name-pick").forEach(btn => {
+        btn.addEventListener("click", () => {
+          confirmCustomer(btn.dataset.question, btn.dataset.surname, btn.dataset.customerId);
+        });
+      });
+
+      messages.appendChild(row);
+
+      row.querySelectorAll("[data-action]").forEach(btn => {
+        btn.addEventListener("click", () => {
+          const action = btn.dataset.action;
+
+          if (action === "toggle-chart") {
+            const chartWrap = row.querySelector(".chart-wrap");
+            const isVisible = chartWrap && !chartWrap.classList.contains("hidden");
+            if (isVisible) {
+              hideChart(row, chartId);
+              if (lastResultContext) lastResultContext.chart_type = "table";
+            } else {
+              const spec = showChart(row, chartId, rows, chartSpec?.type || "bar");
+              if (spec && lastResultContext) lastResultContext.chart_type = spec.type;
+            }
+            return;
+          }
+
+          if (action === "chart") {
+            const spec = showChart(row, chartId, rows, btn.dataset.chartType);
+            if (spec && lastResultContext) lastResultContext.chart_type = spec.type;
+            return;
+          }
+
+          if (action === "csv") {
+            exportRowsAsCsv(rows);
+            return;
+          }
+
+          if (action === "load-more") {
+            loadMoreRows(row, rows);
+            return;
+          }
+        });
+      });
+
+      messages.scrollTop = messages.scrollHeight;
+
+      if (!options.needsConfirmation && rows && rows.length > 0 && query && query !== "NA") {
+        const context = buildResultMemory(
+          rows,
+          query,
+          options.question || options.originalQuestion || lastUserQuestion,
+          chartSpec?.type || options.chartType || resolvedChartType || "table"
+        );
+        lastResultContext = {
+          question: context.question,
+          answer,
+          query,
+          data: rows.slice(0, 100),
+          chart_type: context.chart_type,
+          memory: context.memory
+        };
+      }
+
+      const historyParts = [answer];
+      if (query && query !== "NA") historyParts.push(`SQL: ${query}`);
+      if (rows && rows.length > 0) {
+        const columns = Object.keys(rows[0]);
+        historyParts.push(`Columns: ${columns.join(", ")}`);
+        historyParts.push(`Rows shown: ${rows.length}`);
+        historyParts.push(`First rows: ${JSON.stringify(rows.slice(0, 5))}`);
+      }
+      chatHistory.push({ role: "assistant", content: historyParts.join("\n") });
+    }
+
+    function addBot(text, meta) {
+      addRow("bot", text, meta);
+      chatHistory.push({ role: "assistant", content: text });
+    }
+
+    function addUser(text) {
+      addRow("user", text);
+      chatHistory.push({ role: "user", content: text });
+    }
+
+    function escapeHtml(str) {
+      return String(str).replace(/[&<>"']/g, c => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+      }[c]));
+    }
+
+    function escapeAttr(str) {
+      return escapeHtml(str).replace(/`/g, "&#96;");
+    }
+
+    function resizeInput() {
+      input.style.height = "auto";
+      input.style.height = `${Math.min(input.scrollHeight, 160)}px`;
+    }
+
+    async function sendQuestion(text, confirmedSurname, confirmedCustomerId) {
+      const history = chatHistory.slice(-8);
+      send.disabled = true;
+
+      const thinking = document.createElement("div");
+      thinking.className = "row bot";
+      thinking.innerHTML = `<div class="avatar">AI</div><div class="bubble">Thinking...</div>`;
+      messages.appendChild(thinking);
+      messages.scrollTop = messages.scrollHeight;
+
+      try {
+        const payload = { message: text, history };
+        if (lastResultContext) payload.last_result = lastResultContext;
+        if (confirmedSurname) payload.confirmed_surname = confirmedSurname;
+        if (confirmedCustomerId) payload.confirmed_customer_id = String(confirmedCustomerId);
+
+        const res = await fetch(`${base}/api/AskQuestion`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        thinking.remove();
+
+        if (data.error && !data.answer) {
+          addBot(friendlyError(data));
+          return;
+        }
+
+        if (data.error && data.answer) {
+          addBotResponse(
+            friendlyError(data),
+            data.data || [],
+            data.query || "",
+            {
+              chartType: data.chart_type || "table",
+              question: text
+            }
+          );
+          return;
+        }
+
+        addBotResponse(
+          data.answer || "I couldn't find an answer.",
+          data.data || [],
+          data.query || "",
+          {
+            needsConfirmation: !!data.needs_confirmation,
+            candidates: data.candidates || [],
+            originalQuestion: text,
+            question: text,
+            chartType: data.chart_type || "table"
+          }
+        );
+      } catch (err) {
+        thinking.remove();
+        addBot(`Sorry, I couldn't reach the server.\n\n${err.message}`);
+      } finally {
+        send.disabled = false;
+        input.focus();
+      }
+    }
+
+    async function confirmCustomer(originalQuestion, surname, customerId) {
+      const label = customerId ? `${surname} (ID: ${customerId})` : surname;
+      addUser(`Yes, ${label}`);
+      await sendQuestion(originalQuestion, surname, customerId);
+    }
+
+    async function askQuestion() {
+      const text = input.value.trim();
+      if (!text) return;
+
+      lastUserQuestion = text;
+      addUser(text);
+      input.value = "";
+      resizeInput();
+      await sendQuestion(text);
+    }
+
+    send.addEventListener("click", askQuestion);
+    input.addEventListener("input", resizeInput);
+    input.addEventListener("keydown", e => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        askQuestion();
+      }
+    });
+
+    checkStatus();
+    resizeInput();
+    input.focus();
+  </script>
+</body>
+</html>
