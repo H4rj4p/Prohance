@@ -54,7 +54,7 @@ def load_text_file(file_name):
     path = BASE_DIR / file_name
     return path.read_text(encoding="utf-8") if path.exists() else ""
 
-
+ 
 def parse_connection_string(connection_string):
     values = {}
     for part in connection_string.split(";"):
