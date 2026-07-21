@@ -1,0 +1,42 @@
+-- Who logged the most hours yesterday?
+SELECT TOP (10) userName, employeeid, location, logged_hours
+FROM EmployeeAttendance
+WHERE sessionDate = CAST(DATEADD(day, -1, GETDATE()) AS DATE)
+ORDER BY logged_hours DESC;
+
+-- Average logged hours by location this month
+SELECT location, AVG(COALESCE(logged_hours, 0)) AS avg_logged_hours, COUNT(*) AS sessions
+FROM EmployeeAttendance
+WHERE sessionDate >= DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1)
+GROUP BY location
+ORDER BY avg_logged_hours DESC;
+
+-- Late logins for a named employee
+SELECT sessionDate, userName, firstLogin, late_login, lateLoginComment
+FROM EmployeeAttendance
+WHERE userName LIKE 'John%'
+  AND late_login = 1
+ORDER BY sessionDate DESC;
+
+-- Break summary for yesterday
+SELECT
+  userName,
+  COALESCE(aafsBreak, 0) AS aafsBreak,
+  COALESCE(aafsLunchBreak, 0) AS aafsLunchBreak,
+  COALESCE(aafsShortBreak, 0) AS aafsShortBreak,
+  COALESCE(aafsPersonalTime, 0) AS aafsPersonalTime,
+  COALESCE(aafsBreak, 0) + COALESCE(aafsLunchBreak, 0)
+    + COALESCE(aafsShortBreak, 0) + COALESCE(aafsPersonalTime, 0) AS total_break_time
+FROM EmployeeAttendance
+WHERE sessionDate = CAST(DATEADD(day, -1, GETDATE()) AS DATE)
+ORDER BY total_break_time DESC;
+
+-- Top meeting / AAFS activity this week
+SELECT TOP (10)
+  userName,
+  COALESCE(aafsMeeting, 0) AS aafsMeeting,
+  COALESCE(aafsConferenceCall, 0) AS aafsConferenceCall,
+  COALESCE(aafsTraining, 0) AS aafsTraining
+FROM EmployeeAttendance
+WHERE sessionDate >= DATEADD(day, 1 - DATEPART(weekday, GETDATE()), CAST(GETDATE() AS DATE))
+ORDER BY aafsMeeting DESC;

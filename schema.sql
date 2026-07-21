@@ -1,1 +1,36 @@
-test
+-- Primary workforce / attendance table for IRI Prohance data.
+-- If the live SQL Server table name differs, the app will detect it and
+-- substitute the real name when generating queries.
+CREATE TABLE EmployeeAttendance (
+  employeeid INT,
+  userName NVARCHAR(255),
+  location NVARCHAR(255),
+  shiftName NVARCHAR(255),
+  sessionDate DATE,
+  firstLogin DATETIME,
+  lastLogin DATETIME,
+  logged_hours FLOAT,
+  firstSwipeIn DATETIME,
+  lastSwipeOut DATETIME,
+  late_login BIT,
+  lateLoginComment NVARCHAR(MAX),
+  earlyLogoutComment NVARCHAR(MAX),
+  aafsConferenceCall FLOAT,
+  aafsTraining FLOAT,
+  aafsMeeting FLOAT,
+  aafsWorkReview FLOAT,
+  aafsUnknownTafs FLOAT,
+  aafsItDeskSupport FLOAT,
+  aafsTeamMeeting FLOAT,
+  aafsOfficefunactivity FLOAT,
+  aafsDocumentMgmt FLOAT,
+  aafsSalesCall FLOAT,
+  aafsNamesOnBoard FLOAT,
+  aafsOnDeskSupport FLOAT,
+  aafBaqHseq FLOAT,
+  aafsInterview FLOAT,
+  aafsBreak FLOAT,
+  aafsLunchBreak FLOAT,
+  aafsShortBreak FLOAT,
+  aafsPersonalTime FLOAT
+);
