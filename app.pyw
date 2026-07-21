@@ -438,11 +438,37 @@ def extract_sql_query(raw):
     except ValueError:
         pass
 
-    match = re.search(r"\bSELECT\b[\s\S]+", raw, re.IGNORECASE)
-    if match:
-        return match.group(0).strip().rstrip(";")
+    # Prefer a full CTE (WITH ... SELECT) over the first inner SELECT.
+    with_match = re.search(r"(?:^|;)\s*(WITH\b[\s\S]+)", raw, re.IGNORECASE)
+    select_match = re.search(r"\bSELECT\b[\s\S]+", raw, re.IGNORECASE)
+
+    if with_match and select_match and with_match.start() <= select_match.start():
+        return with_match.group(1).strip().rstrip(";")
+    if select_match:
+        return select_match.group(0).strip().rstrip(";")
+    if with_match:
+        return with_match.group(1).strip().rstrip(";")
 
     return raw
+
+
+def normalize_readonly_sql(sql):
+    """Strip leading noise that SQL Server models often add before a SELECT/WITH."""
+    if not sql:
+        return sql
+
+    sql = sql.strip().lstrip(";").strip()
+    # Drop leading USE / SET lines (e.g. SET NOCOUNT ON) before the real query.
+    while True:
+        match = re.match(
+            r"^(?:USE\b[^;\n]*|SET\b[^;\n]*);?\s*",
+            sql,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            break
+        sql = sql[match.end():].lstrip(";").strip()
+    return sql
 
 
 def clean_sql(sql, actual_table_name="EmployeeAttendance"):
@@ -458,9 +484,9 @@ def clean_sql(sql, actual_table_name="EmployeeAttendance"):
         .strip()
         .rstrip(";")
     )
+    sql = normalize_readonly_sql(sql)
     sql = fix_username_prefix_match(fix_workforce_schema(sql, actual_table_name))
     return convert_limit_to_top(sql)
-
 
 def fix_username_prefix_match(sql):
     sql = re.sub(
@@ -564,14 +590,33 @@ def strip_comments(sql):
     return sql.strip()
 
 
+def strip_string_literals(sql):
+    sql = re.sub(r"N?'(?:''|[^'])*'", "''", sql)
+    sql = re.sub(r'"(?:""|[^"])*"', '""', sql)
+    return sql
+
+
 def validate_select_query(sql):
     if not sql or not sql.strip():
         return False, "Query is empty."
 
-    stripped = strip_comments(sql.strip().rstrip(";"))
-    if ";" in stripped:
-        return False, "Multiple SQL statements are not allowed."
+    stripped = normalize_readonly_sql(strip_comments(sql.strip().rstrip(";")))
+    if not stripped:
+        return False, "Query is empty."
 
+    # Keep only the first statement if the model appended explanation text.
+    if ";" in stripped:
+        first, rest = stripped.split(";", 1)
+        if re.search(r"\b(SELECT|WITH)\b", first, re.IGNORECASE) and not re.search(
+            r"\b(SELECT|WITH|INSERT|UPDATE|DELETE|DROP|EXEC|EXECUTE)\b",
+            rest,
+            re.IGNORECASE,
+        ):
+            stripped = first.strip()
+        else:
+            return False, "Multiple SQL statements are not allowed."
+
+    keyword_scan = strip_string_literals(stripped)
     for keyword in (
         "INSERT",
         "UPDATE",
@@ -586,20 +631,21 @@ def validate_select_query(sql):
         "GRANT",
         "REVOKE",
     ):
-        if re.search(rf"\b{keyword}\b", stripped, re.IGNORECASE):
+        if re.search(rf"\b{keyword}\b", keyword_scan, re.IGNORECASE):
             return False, f"Blocked keyword detected: {keyword}."
 
-    if re.search(r"\bSELECT\b[\s\S]+\bINTO\b", stripped, re.IGNORECASE):
+    # Allow "SELECT ... FROM ... INTO" only when it is SELECT INTO (write).
+    if re.search(r"\bSELECT\b[\s\S]*?\bINTO\b\s+[\#\[]?\w+", keyword_scan, re.IGNORECASE):
         return False, "SELECT INTO is not allowed."
 
-    if stripped.upper().startswith("SELECT"):
+    upper = stripped.upper()
+    if upper.startswith("SELECT") or upper.startswith("("):
         return True, ""
 
-    if stripped.upper().startswith("WITH") and re.search(r"\bSELECT\b", stripped, re.IGNORECASE):
+    if upper.startswith("WITH") and re.search(r"\bSELECT\b", stripped, re.IGNORECASE):
         return True, ""
 
     return False, "Only read-only SELECT queries are allowed."
-
 
 def make_json_value(value):
     if isinstance(value, Decimal):
@@ -966,7 +1012,10 @@ def generate_sql(question, history, primary_table, confirmed_username, confirmed
     raw = get_openai_completion(
         system_prompt=(
             f"{instructions_text}\n\nDatabase Schema:\n{schema_text}\n\n"
-            f"Example Queries:\n{samples_text}{table_hint}"
+            f"Example Queries:\n{samples_text}{table_hint}\n\n"
+            "Return ONLY one read-only SQL Server query. "
+            "It must be a single SELECT or WITH ... SELECT statement. "
+            "No markdown, no explanation, no USE/SET/INSERT/UPDATE/DELETE."
         ),
         user_prompt=prompt_question,
     )
