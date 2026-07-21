@@ -486,7 +486,8 @@ def clean_sql(sql, actual_table_name="EmployeeAttendance"):
     )
     sql = normalize_readonly_sql(sql)
     sql = fix_username_prefix_match(fix_workforce_schema(sql, actual_table_name))
-    return convert_limit_to_top(sql)
+    sql = convert_limit_to_top(sql)
+    return ensure_single_readonly_sql(sql)
 
 def fix_username_prefix_match(sql):
     sql = re.sub(
@@ -596,25 +597,92 @@ def strip_string_literals(sql):
     return sql
 
 
+def split_sql_statements(sql):
+    """Split on semicolons that are outside string literals."""
+    parts = []
+    buffer = []
+    in_single_quote = False
+    index = 0
+    while index < len(sql):
+        char = sql[index]
+        if in_single_quote:
+            buffer.append(char)
+            if char == "'":
+                if index + 1 < len(sql) and sql[index + 1] == "'":
+                    buffer.append(sql[index + 1])
+                    index += 2
+                    continue
+                in_single_quote = False
+            index += 1
+            continue
+
+        if char == "'":
+            in_single_quote = True
+            buffer.append(char)
+            index += 1
+            continue
+
+        if char == ";":
+            piece = "".join(buffer).strip()
+            if piece:
+                parts.append(piece)
+            buffer = []
+            index += 1
+            continue
+
+        buffer.append(char)
+        index += 1
+
+    piece = "".join(buffer).strip()
+    if piece:
+        parts.append(piece)
+    return parts
+
+
+def ensure_single_readonly_sql(sql):
+    """
+    Models often emit WITH ...; SELECT ..., SET + SELECT, or a second SELECT.
+    Keep one read-only statement instead of blocking the whole request.
+    """
+    if not sql or not sql.strip():
+        return sql
+
+    stripped = normalize_readonly_sql(strip_comments(sql.strip().rstrip(";")))
+    parts = split_sql_statements(stripped)
+    if not parts:
+        return stripped
+
+    merged = []
+    index = 0
+    while index < len(parts):
+        part = parts[index]
+        next_part = parts[index + 1] if index + 1 < len(parts) else None
+        if (
+            part.upper().startswith("WITH")
+            and next_part
+            and re.match(r"^\s*SELECT\b", next_part, re.IGNORECASE)
+        ):
+            merged.append(f"{part} {next_part}")
+            index += 2
+            continue
+        merged.append(part)
+        index += 1
+
+    for part in merged:
+        upper = part.lstrip().upper()
+        if upper.startswith("SELECT") or upper.startswith("WITH") or upper.startswith("("):
+            return part.strip()
+
+    return merged[0].strip()
+
+
 def validate_select_query(sql):
     if not sql or not sql.strip():
         return False, "Query is empty."
 
-    stripped = normalize_readonly_sql(strip_comments(sql.strip().rstrip(";")))
+    stripped = ensure_single_readonly_sql(sql)
     if not stripped:
         return False, "Query is empty."
-
-    # Keep only the first statement if the model appended explanation text.
-    if ";" in stripped:
-        first, rest = stripped.split(";", 1)
-        if re.search(r"\b(SELECT|WITH)\b", first, re.IGNORECASE) and not re.search(
-            r"\b(SELECT|WITH|INSERT|UPDATE|DELETE|DROP|EXEC|EXECUTE)\b",
-            rest,
-            re.IGNORECASE,
-        ):
-            stripped = first.strip()
-        else:
-            return False, "Multiple SQL statements are not allowed."
 
     keyword_scan = strip_string_literals(stripped)
     for keyword in (
@@ -1190,6 +1258,7 @@ def ask_question():
         )
         sql_query = clean_sql(sql_query, primary_table)
         sql_query = remove_broad_query_limit(sql_query, question)
+        sql_query = ensure_single_readonly_sql(sql_query)
 
         if sql_query.upper() == "NA":
             return jsonify(
