@@ -203,20 +203,27 @@ class SchemaProvider:
         return tables
 
     def get_schema_text(self):
+        duration_note = (
+            "\n-- IMPORTANT: logged_hours and aafs*/break duration columns are often "
+            "stored as VARCHAR 'HH:MM:SS' (example '00:53:45'). "
+            "Convert to seconds with DATEDIFF(SECOND, 0, TRY_CAST(... AS TIME)) "
+            "before AVG, SUM, or addition. Never COALESCE(column, 0) on those varchar times.\n"
+        )
+
         live_schema = self._load_schema_from_database()
         if live_schema and "CREATE TABLE" in live_schema.upper():
-            return live_schema
+            return live_schema + duration_note
 
         file_schema = self._load_schema_file()
         live_table = self.get_primary_table_name()
 
         if file_schema and live_table:
-            return file_schema.replace("EmployeeAttendance", live_table)
+            return file_schema.replace("EmployeeAttendance", live_table) + duration_note
 
         if file_schema:
-            return file_schema
+            return file_schema + duration_note
 
-        return live_schema or "-- No schema available."
+        return (live_schema or "-- No schema available.") + duration_note
 
     @staticmethod
     def _load_schema_file():
@@ -305,6 +312,33 @@ CATEGORY_COLUMNS = {
     "latelogincomment",
 }
 VALID_CHART_TYPES = {"bar", "line", "pie"}
+
+NAME_STOPWORDS = {
+    "a", "an", "the", "and", "or", "for", "of", "on", "in", "at", "to", "from", "by",
+    "with", "as", "if", "so", "than", "then", "into", "over", "under", "about",
+    "is", "are", "was", "were", "be", "been", "being", "am",
+    "what", "whats", "who", "whose", "whom", "which", "when", "where", "why", "how",
+    "many", "much", "avg", "average", "mean", "total", "sum", "count", "number",
+    "logged", "hours", "hour", "break", "breaks", "lunch", "personal", "time", "times",
+    "login", "logins", "logout", "late", "early", "shift", "shifts", "location",
+    "locations", "session", "sessions", "attendance", "activity", "activities",
+    "today", "yesterday", "tomorrow", "this", "that", "these", "those", "last", "next",
+    "week", "weeks", "month", "months", "year", "years", "day", "days", "daily",
+    "january", "february", "march", "april", "may", "june", "july", "august",
+    "september", "october", "november", "december",
+    "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec",
+    "he", "she", "him", "her", "his", "hers", "they", "them", "their", "i", "me", "my",
+    "we", "our", "you", "your", "someone", "somebody", "anyone", "anybody",
+    "does", "do", "did", "have", "has", "had", "get", "got", "give", "show", "list",
+    "tell", "please", "can", "could", "would", "should", "will", "just", "also", "only",
+    "all", "any", "some", "each", "every", "both", "between", "during", "before",
+    "after", "since", "until", "per", "vs", "versus", "compare", "compared",
+    "employee", "employees", "person", "people", "user", "users", "name", "named",
+    "called", "aafs", "meeting", "meetings", "training", "call", "calls",
+    "record", "records", "data", "info", "information", "report", "summary",
+    "long", "short", "most", "least", "top", "bottom", "highest", "lowest",
+    "first", "second", "third", "one", "two", "three", "four", "five",
+}
 
 
 def is_multi_part(question):
@@ -820,32 +854,125 @@ def get_candidates(results):
     return sorted(candidates, key=lambda c: (c["username"].lower(), str(c["employee_id"])))
 
 
-def should_confirm(candidates, question, confirmed_employee_id):
-    if confirmed_employee_id:
+def sql_literal(value):
+    return str(value).replace("'", "''")
+
+
+def extract_name_hints(question):
+    """Pull likely first/last name tokens from a question."""
+    text = question or ""
+    text = re.sub(r"\b20\d{2}\b", " ", text)
+    text = re.sub(r"\b\d{1,2}[/-]\d{1,2}([/-]\d{2,4})?\b", " ", text)
+    text = re.sub(r"[`\"“”]", " ", text)
+
+    tokens = re.findall(r"[A-Za-z][A-Za-z'.-]*", text)
+    hints = []
+    seen = set()
+    for token in tokens:
+        cleaned = token.strip(".'-")
+        key = cleaned.lower()
+        if len(cleaned) < 2 or key in NAME_STOPWORDS or key in seen:
+            continue
+        seen.add(key)
+        hints.append(cleaned)
+        if len(hints) >= 4:
+            break
+    return hints
+
+
+def find_matching_employees(table_name, name_hints, limit=20):
+    """Match employees by first name, last name, or both against userName."""
+    if not table_name or not name_hints:
+        return []
+
+    where_parts = [
+        f"userName LIKE '%{sql_literal(hint)}%'"
+        for hint in name_hints
+    ]
+    where_sql = " AND ".join(where_parts)
+    if len(name_hints) >= 2:
+        ordered = "%" + "%".join(sql_literal(hint) for hint in name_hints) + "%"
+        where_sql = f"(({where_sql}) OR userName LIKE '{ordered}')"
+
+    sql = f"""
+        SELECT DISTINCT TOP ({int(limit)})
+            userName AS username,
+            employeeid AS employee_id
+        FROM [{table_name}]
+        WHERE {where_sql}
+        ORDER BY userName, employeeid
+    """
+
+    try:
+        rows = execute_sql(sql)
+    except Exception:
+        sql = f"""
+            SELECT DISTINCT TOP ({int(limit)})
+                userName AS username
+            FROM [{table_name}]
+            WHERE {where_sql}
+            ORDER BY userName
+        """
+        try:
+            rows = execute_sql(sql)
+        except Exception:
+            return []
+
+    seen = set()
+    matches = []
+    for row in rows:
+        username = str(row.get("username") or "").strip()
+        if not username:
+            continue
+        employee_id = row.get("employee_id")
+        dedupe_key = f"{username.lower()}::{employee_id}"
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        matches.append({"username": username, "employee_id": employee_id})
+    return matches
+
+
+def resolve_employee_from_question(question, table_name, confirmed_username, confirmed_employee_id):
+    """
+    Resolve a person mentioned by first name, last name, or both.
+    Returns (confirmed_username, confirmed_employee_id, candidates_needing_confirmation).
+    """
+    if confirmed_employee_id or confirmed_username:
+        return confirmed_username, confirmed_employee_id, []
+
+    hints = extract_name_hints(question)
+    if not hints:
+        return None, None, []
+
+    matches = find_matching_employees(table_name, hints)
+    if not matches and len(hints) > 1:
+        matches = find_matching_employees(table_name, [hints[0]])
+
+    if len(matches) == 1:
+        match = matches[0]
+        employee_id = match.get("employee_id")
+        return (
+            match.get("username"),
+            str(employee_id) if employee_id is not None else None,
+            [],
+        )
+
+    if len(matches) > 1:
+        return None, None, matches
+
+    return None, None, []
+
+
+def should_confirm(candidates, question, confirmed_employee_id, confirmed_username=None):
+    if confirmed_employee_id or confirmed_username:
         return False
     if len(candidates) <= 1:
         return False
     if COMPARISON_PATTERN.search(question or ""):
         return False
-    if LISTING_PATTERN.search(question or ""):
-        return False
-
-    username_counts = {}
-    for candidate in candidates:
-        username = str(candidate.get("username") or "").strip().lower()
-        if username:
-            username_counts[username] = username_counts.get(username, 0) + 1
-
-    duplicate_names = [
-        username
-        for username, count in username_counts.items()
-        if count > 1
-    ]
-    question_text = question or ""
-    return any(
-        re.search(rf"\b{re.escape(username)}\b", question_text, re.IGNORECASE)
-        for username in duplicate_names
-    )
+    # Only ask when the question appears to name a person.
+    return bool(extract_name_hints(question))
 
 
 def wants_chart(question):
@@ -1296,6 +1423,28 @@ def ask_question():
                 }
             )
 
+        confirmed_username, confirmed_employee_id, name_matches = resolve_employee_from_question(
+            question,
+            primary_table,
+            confirmed_username,
+            confirmed_employee_id,
+        )
+        if name_matches:
+            hint_text = " ".join(extract_name_hints(question)) or "that name"
+            return jsonify(
+                {
+                    "query": "",
+                    "answer": (
+                        f'I found {len(name_matches)} people matching "{hint_text}". '
+                        "Which one did you mean?"
+                    ),
+                    "needs_confirmation": True,
+                    "candidates": name_matches,
+                    "data": [],
+                    "chart_type": "table",
+                }
+            )
+
         sql_query = generate_sql(
             question,
             history,
@@ -1335,11 +1484,15 @@ def ask_question():
 
         results = execute_sql(sql_query)
         candidates = get_candidates(results)
-        if should_confirm(candidates, question, confirmed_employee_id):
+        if should_confirm(candidates, question, confirmed_employee_id, confirmed_username):
+            hint_text = " ".join(extract_name_hints(question)) or "that name"
             return jsonify(
                 {
                     "query": sql_query,
-                    "answer": f"I found {len(candidates)} matching employees. Which one did you mean?",
+                    "answer": (
+                        f'I found {len(candidates)} people matching "{hint_text}". '
+                        "Which one did you mean?"
+                    ),
                     "needs_confirmation": True,
                     "candidates": candidates,
                     "data": results,

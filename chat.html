@@ -863,7 +863,7 @@
             data-username="${escapeAttr(username)}"
             data-employee-id="${escapeAttr(employeeId ?? "")}"
             data-question="${escapeAttr(originalQuestion)}">
-            ${escapeHtml(label)}
+            Did you mean ${escapeHtml(label)}?
           </button>
         `;
       }).join("");
