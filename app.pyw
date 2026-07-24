@@ -312,15 +312,38 @@ def is_multi_part(question):
 
 
 def enhance_for_sql(question):
-    if not is_multi_part(question):
+    notes = []
+    text = question or ""
+
+    if is_multi_part(question):
+        notes.append(
+            "IMPORTANT: This message asks MULTIPLE things at once. "
+            "Return exactly ONE SELECT statement (no semicolons) that answers EVERY part. "
+            "Combine results using multiple columns, aggregates, CASE/SUM, and subqueries in the same query."
+        )
+
+    if re.search(r"\b(average|avg|mean|total|sum|overall)\b", text, re.IGNORECASE):
+        notes.append(
+            "IMPORTANT: The user asked for an aggregate. Use AVG/SUM in SQL over matching rows. "
+            "Do NOT return only the first raw row. "
+            "Duration fields may be VARCHAR 'HH:MM:SS' — convert to seconds before AVG/SUM, "
+            "then convert the result back to HH:MM:SS for display."
+        )
+
+    if re.search(
+        r"\b(break|breaks|aafs|logged\s*hours?|lunch|personal\s*time)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        notes.append(
+            "IMPORTANT: Break/AAFS/logged_hours values look like '00:53:45'. "
+            "Never COALESCE(column, 0) or AVG(column) directly on those varchar times."
+        )
+
+    if not notes:
         return question
 
-    return (
-        question
-        + "\n\nIMPORTANT: This message asks MULTIPLE things at once. "
-        + "Return exactly ONE SELECT statement (no semicolons) that answers EVERY part. "
-        + "Combine results using multiple columns, aggregates, CASE/SUM, and subqueries in the same query."
-    )
+    return text + "\n\n" + "\n".join(notes)
 
 
 def enhance_for_answer(question):
@@ -1059,6 +1082,24 @@ def build_chart_followup_response(question, last_result):
     }
 
 
+def current_date_context():
+    today = date.today()
+    month_start = today.replace(day=1)
+    if today.month == 12:
+        next_month = date(today.year + 1, 1, 1)
+    else:
+        next_month = date(today.year, today.month + 1, 1)
+
+    return (
+        f"Today's date is {today.isoformat()} ({today.strftime('%A')}). "
+        f"Current month is {today.strftime('%B %Y')}. "
+        f"\"This month\" means sessionDate >= '{month_start.isoformat()}' "
+        f"AND sessionDate < '{next_month.isoformat()}'. "
+        "Relative dates like today/yesterday/this week/this month MUST use this date, "
+        "not an assumed year."
+    )
+
+
 def generate_sql(question, history, primary_table, confirmed_username, confirmed_employee_id):
     schema_text = schema_provider.get_schema_text()
     instructions_text = load_text_file("instructions.txt")
@@ -1076,14 +1117,20 @@ def generate_sql(question, history, primary_table, confirmed_username, confirmed
         if primary_table
         else ""
     )
+    date_hint = current_date_context()
 
     raw = get_openai_completion(
         system_prompt=(
             f"{instructions_text}\n\nDatabase Schema:\n{schema_text}\n\n"
             f"Example Queries:\n{samples_text}{table_hint}\n\n"
+            f"{date_hint}\n\n"
             "Return ONLY one read-only SQL Server query. "
             "It must be a single SELECT or WITH ... SELECT statement. "
-            "No markdown, no explanation, no USE/SET/INSERT/UPDATE/DELETE."
+            "No markdown, no explanation, no USE/SET/INSERT/UPDATE/DELETE. "
+            "Duration columns like logged_hours and aafs* breaks are often VARCHAR 'HH:MM:SS'. "
+            "Never COALESCE them with 0 or AVG them directly. Convert to seconds with "
+            "DATEDIFF(SECOND, 0, TRY_CAST(... AS TIME)) before AVG/SUM/addition. "
+            "If the user asks for an average, the SQL MUST include AVG(...) and GROUP BY when needed."
         ),
         user_prompt=prompt_question,
     )

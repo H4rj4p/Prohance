@@ -1,42 +1,68 @@
 -- Who logged the most hours yesterday?
-SELECT TOP (10) userName, employeeid, location, logged_hours
+-- Convert HH:MM:SS durations to seconds before sorting.
+SELECT TOP (10)
+  userName,
+  employeeid,
+  location,
+  logged_hours,
+  COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(logged_hours)), '') AS TIME)), 0) AS logged_seconds
 FROM EmployeeAttendance
 WHERE sessionDate = CAST(DATEADD(day, -1, GETDATE()) AS DATE)
-ORDER BY logged_hours DESC;
+ORDER BY logged_seconds DESC;
 
--- Average logged hours by location this month
-SELECT location, AVG(COALESCE(logged_hours, 0)) AS avg_logged_hours, COUNT(*) AS sessions
+-- Average logged hours for one employee this month
+SELECT
+  userName,
+  CONVERT(varchar(8), DATEADD(SECOND, CAST(ROUND(AVG(
+    COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(logged_hours)), '') AS TIME)), 0)
+  ), 0) AS int), 0), 108) AS avg_logged_hours,
+  COUNT(*) AS session_count
 FROM EmployeeAttendance
-WHERE sessionDate >= DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1)
-GROUP BY location
-ORDER BY avg_logged_hours DESC;
+WHERE userName LIKE '%Harzh%Mevada%'
+  AND sessionDate >= DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1)
+  AND sessionDate < DATEADD(month, 1, DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1))
+GROUP BY userName;
+
+-- Average total break for one employee in July 2026
+SELECT
+  userName,
+  CONVERT(varchar(8), DATEADD(SECOND, CAST(ROUND(AVG(
+    COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(aafsBreak)), '') AS TIME)), 0)
+    + COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(aafsLunchBreak)), '') AS TIME)), 0)
+    + COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(aafsShortBreak)), '') AS TIME)), 0)
+    + COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(aafsPersonalTime)), '') AS TIME)), 0)
+  ), 0) AS int), 0), 108) AS avg_total_break,
+  COUNT(*) AS session_count
+FROM EmployeeAttendance
+WHERE userName LIKE '%Harzh%Mevada%'
+  AND sessionDate >= '2026-07-01'
+  AND sessionDate < '2026-08-01'
+GROUP BY userName;
 
 -- Late logins for a named employee
 SELECT sessionDate, userName, firstLogin, late_login, lateLoginComment
 FROM EmployeeAttendance
-WHERE userName LIKE 'John%'
+WHERE userName LIKE '%John%'
   AND late_login = 1
 ORDER BY sessionDate DESC;
 
--- Break summary for yesterday
+-- Break averages by employee this month
 SELECT
   userName,
-  COALESCE(aafsBreak, 0) AS aafsBreak,
-  COALESCE(aafsLunchBreak, 0) AS aafsLunchBreak,
-  COALESCE(aafsShortBreak, 0) AS aafsShortBreak,
-  COALESCE(aafsPersonalTime, 0) AS aafsPersonalTime,
-  COALESCE(aafsBreak, 0) + COALESCE(aafsLunchBreak, 0)
-    + COALESCE(aafsShortBreak, 0) + COALESCE(aafsPersonalTime, 0) AS total_break_time
+  CONVERT(varchar(8), DATEADD(SECOND, CAST(ROUND(AVG(
+    COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(aafsBreak)), '') AS TIME)), 0)
+    + COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(aafsLunchBreak)), '') AS TIME)), 0)
+    + COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(aafsShortBreak)), '') AS TIME)), 0)
+    + COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(aafsPersonalTime)), '') AS TIME)), 0)
+  ), 0) AS int), 0), 108) AS avg_total_break,
+  COUNT(*) AS session_count
 FROM EmployeeAttendance
-WHERE sessionDate = CAST(DATEADD(day, -1, GETDATE()) AS DATE)
-ORDER BY total_break_time DESC;
-
--- Top meeting / AAFS activity this week
-SELECT TOP (10)
-  userName,
-  COALESCE(aafsMeeting, 0) AS aafsMeeting,
-  COALESCE(aafsConferenceCall, 0) AS aafsConferenceCall,
-  COALESCE(aafsTraining, 0) AS aafsTraining
-FROM EmployeeAttendance
-WHERE sessionDate >= DATEADD(day, 1 - DATEPART(weekday, GETDATE()), CAST(GETDATE() AS DATE))
-ORDER BY aafsMeeting DESC;
+WHERE sessionDate >= DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1)
+  AND sessionDate < DATEADD(month, 1, DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1))
+GROUP BY userName
+ORDER BY AVG(
+  COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(aafsBreak)), '') AS TIME)), 0)
+  + COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(aafsLunchBreak)), '') AS TIME)), 0)
+  + COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(aafsShortBreak)), '') AS TIME)), 0)
+  + COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(aafsPersonalTime)), '') AS TIME)), 0)
+) DESC;

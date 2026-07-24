@@ -1,6 +1,6 @@
 -- Primary workforce / attendance table for IRI Prohance data.
--- If the live SQL Server table name differs, the app will detect it and
--- substitute the real name when generating queries.
+-- Duration fields are commonly stored as VARCHAR HH:MM:SS (e.g. '00:53:45'),
+-- not as numeric hours. Convert to seconds before AVG/SUM/math.
 CREATE TABLE EmployeeAttendance (
   employeeid INT,
   userName NVARCHAR(255),
@@ -9,28 +9,28 @@ CREATE TABLE EmployeeAttendance (
   sessionDate DATE,
   firstLogin DATETIME,
   lastLogin DATETIME,
-  logged_hours FLOAT,
+  logged_hours VARCHAR(16), -- often 'HH:MM:SS'
   firstSwipeIn DATETIME,
   lastSwipeOut DATETIME,
   late_login BIT,
   lateLoginComment NVARCHAR(MAX),
   earlyLogoutComment NVARCHAR(MAX),
-  aafsConferenceCall FLOAT,
-  aafsTraining FLOAT,
-  aafsMeeting FLOAT,
-  aafsWorkReview FLOAT,
-  aafsUnknownTafs FLOAT,
-  aafsItDeskSupport FLOAT,
-  aafsTeamMeeting FLOAT,
-  aafsOfficefunactivity FLOAT,
-  aafsDocumentMgmt FLOAT,
-  aafsSalesCall FLOAT,
-  aafsNamesOnBoard FLOAT,
-  aafsOnDeskSupport FLOAT,
-  aafBaqHseq FLOAT,
-  aafsInterview FLOAT,
-  aafsBreak FLOAT,
-  aafsLunchBreak FLOAT,
-  aafsShortBreak FLOAT,
-  aafsPersonalTime FLOAT
+  aafsConferenceCall VARCHAR(16),
+  aafsTraining VARCHAR(16),
+  aafsMeeting VARCHAR(16),
+  aafsWorkReview VARCHAR(16),
+  aafsUnknownTafs VARCHAR(16),
+  aafsItDeskSupport VARCHAR(16),
+  aafsTeamMeeting VARCHAR(16),
+  aafsOfficefunactivity VARCHAR(16),
+  aafsDocumentMgmt VARCHAR(16),
+  aafsSalesCall VARCHAR(16),
+  aafsNamesOnBoard VARCHAR(16),
+  aafsOnDeskSupport VARCHAR(16),
+  aafBaqHseq VARCHAR(16),
+  aafsInterview VARCHAR(16),
+  aafsBreak VARCHAR(16),
+  aafsLunchBreak VARCHAR(16),
+  aafsShortBreak VARCHAR(16),
+  aafsPersonalTime VARCHAR(16)
 );
