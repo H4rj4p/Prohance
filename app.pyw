@@ -139,23 +139,32 @@ def rows_as_dicts(cursor):
 
 class SchemaProvider:
     def __init__(self):
-        self._cached_customers_table = None
+        self._cached_primary_table = None
 
-    def get_customers_table_name(self):
-        if self._cached_customers_table:
-            return self._cached_customers_table
+    def get_primary_table_name(self):
+        if self._cached_primary_table:
+            return self._cached_primary_table
 
         if get_connection_string() is None:
             return None
 
+        # Prefer the workforce/attendance table described in instructions.txt.
         sql = """
             SELECT TOP (1) TABLE_NAME
             FROM INFORMATION_SCHEMA.COLUMNS
             WHERE TABLE_CATALOG = DB_NAME()
-              AND COLUMN_NAME IN ('Surname', 'CreditScore', 'CustomerId')
+              AND LOWER(COLUMN_NAME) IN (
+                    'employeeid', 'username', 'sessiondate',
+                    'logged_hours', 'firstname', 'lastname'
+              )
             GROUP BY TABLE_NAME
-            HAVING SUM(CASE WHEN COLUMN_NAME = 'Surname' THEN 1 ELSE 0 END) > 0
-            ORDER BY TABLE_NAME
+            HAVING
+                SUM(CASE WHEN LOWER(COLUMN_NAME) IN ('employeeid', 'username') THEN 1 ELSE 0 END) > 0
+                OR SUM(CASE WHEN LOWER(COLUMN_NAME) = 'sessiondate' THEN 1 ELSE 0 END) > 0
+            ORDER BY
+                SUM(CASE WHEN LOWER(COLUMN_NAME) = 'sessiondate' THEN 1 ELSE 0 END) DESC,
+                SUM(CASE WHEN LOWER(COLUMN_NAME) = 'employeeid' THEN 1 ELSE 0 END) DESC,
+                TABLE_NAME
         """
 
         try:
@@ -163,10 +172,15 @@ class SchemaProvider:
                 with connection.cursor() as cursor:
                     cursor.execute(sql)
                     row = cursor.fetchone()
-                    self._cached_customers_table = row.TABLE_NAME if row else None
-                    return self._cached_customers_table
+                    if row:
+                        self._cached_primary_table = row.TABLE_NAME
+                        return self._cached_primary_table
         except Exception:
-            return None
+            pass
+
+        tables = self.list_tables()
+        self._cached_primary_table = tables[0] if tables else None
+        return self._cached_primary_table
 
     def list_tables(self):
         if get_connection_string() is None:
@@ -189,16 +203,27 @@ class SchemaProvider:
         return tables
 
     def get_schema_text(self):
+        duration_note = (
+            "\n-- IMPORTANT: logged_hours and aafs*/break duration columns are often "
+            "stored as VARCHAR 'HH:MM:SS' (example '00:53:45'). "
+            "Convert to seconds with DATEDIFF(SECOND, 0, TRY_CAST(... AS TIME)) "
+            "before AVG, SUM, or addition. Never COALESCE(column, 0) on those varchar times.\n"
+        )
+
+        live_schema = self._load_schema_from_database()
+        if live_schema and "CREATE TABLE" in live_schema.upper():
+            return live_schema + duration_note
+
         file_schema = self._load_schema_file()
-        live_table = self.get_customers_table_name()
+        live_table = self.get_primary_table_name()
 
         if file_schema and live_table:
-            return file_schema.replace("Customers", live_table)
+            return file_schema.replace("EmployeeAttendance", live_table) + duration_note
 
         if file_schema:
-            return file_schema
+            return file_schema + duration_note
 
-        return self._load_schema_from_database()
+        return (live_schema or "-- No schema available.") + duration_note
 
     @staticmethod
     def _load_schema_file():
@@ -272,13 +297,48 @@ COMPARISON_PATTERN = re.compile(
 )
 LISTING_PATTERN = re.compile(
     r"\b(top|bottom|first|last|highest|lowest|most|least|all|list|show|give|"
-    r"rank|ranking|sort|order|customers|people|rows|salar(?:y|ies)|balances?)\b",
+    r"rank|ranking|sort|order|employees?|people|rows|hours|breaks?|meetings?|"
+    r"training|locations?|shifts?)\b",
     re.IGNORECASE,
 )
 
-ID_COLUMNS = {"customerid", "rownumber", "id"}
-CATEGORY_COLUMNS = {"geography", "gender", "surname"}
+ID_COLUMNS = {"employeeid", "id", "rownumber"}
+CATEGORY_COLUMNS = {
+    "username",
+    "location",
+    "shiftname",
+    "sessiondate",
+    "late_login",
+    "latelogincomment",
+}
 VALID_CHART_TYPES = {"bar", "line", "pie"}
+
+NAME_STOPWORDS = {
+    "a", "an", "the", "and", "or", "for", "of", "on", "in", "at", "to", "from", "by",
+    "with", "as", "if", "so", "than", "then", "into", "over", "under", "about",
+    "is", "are", "was", "were", "be", "been", "being", "am",
+    "what", "whats", "who", "whose", "whom", "which", "when", "where", "why", "how",
+    "many", "much", "avg", "average", "mean", "total", "sum", "count", "number",
+    "logged", "hours", "hour", "break", "breaks", "lunch", "personal", "time", "times",
+    "login", "logins", "logout", "late", "early", "shift", "shifts", "location",
+    "locations", "session", "sessions", "attendance", "activity", "activities",
+    "today", "yesterday", "tomorrow", "this", "that", "these", "those", "last", "next",
+    "week", "weeks", "month", "months", "year", "years", "day", "days", "daily",
+    "january", "february", "march", "april", "may", "june", "july", "august",
+    "september", "october", "november", "december",
+    "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec",
+    "he", "she", "him", "her", "his", "hers", "they", "them", "their", "i", "me", "my",
+    "we", "our", "you", "your", "someone", "somebody", "anyone", "anybody",
+    "does", "do", "did", "have", "has", "had", "get", "got", "give", "show", "list",
+    "tell", "please", "can", "could", "would", "should", "will", "just", "also", "only",
+    "all", "any", "some", "each", "every", "both", "between", "during", "before",
+    "after", "since", "until", "per", "vs", "versus", "compare", "compared",
+    "employee", "employees", "person", "people", "user", "users", "name", "named",
+    "called", "aafs", "meeting", "meetings", "training", "call", "calls",
+    "record", "records", "data", "info", "information", "report", "summary",
+    "long", "short", "most", "least", "top", "bottom", "highest", "lowest",
+    "first", "second", "third", "one", "two", "three", "four", "five",
+}
 
 
 def is_multi_part(question):
@@ -286,15 +346,38 @@ def is_multi_part(question):
 
 
 def enhance_for_sql(question):
-    if not is_multi_part(question):
+    notes = []
+    text = question or ""
+
+    if is_multi_part(question):
+        notes.append(
+            "IMPORTANT: This message asks MULTIPLE things at once. "
+            "Return exactly ONE SELECT statement (no semicolons) that answers EVERY part. "
+            "Combine results using multiple columns, aggregates, CASE/SUM, and subqueries in the same query."
+        )
+
+    if re.search(r"\b(average|avg|mean|total|sum|overall)\b", text, re.IGNORECASE):
+        notes.append(
+            "IMPORTANT: The user asked for an aggregate. Use AVG/SUM in SQL over matching rows. "
+            "Do NOT return only the first raw row. "
+            "Duration fields may be VARCHAR 'HH:MM:SS' — convert to seconds before AVG/SUM, "
+            "then convert the result back to HH:MM:SS for display."
+        )
+
+    if re.search(
+        r"\b(break|breaks|aafs|logged\s*hours?|lunch|personal\s*time)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        notes.append(
+            "IMPORTANT: Break/AAFS/logged_hours values look like '00:53:45'. "
+            "Never COALESCE(column, 0) or AVG(column) directly on those varchar times."
+        )
+
+    if not notes:
         return question
 
-    return (
-        question
-        + "\n\nIMPORTANT: This message asks MULTIPLE things at once. "
-        + "Return exactly ONE SELECT statement (no semicolons) that answers EVERY part. "
-        + "Combine results using multiple columns, aggregates, CASE/SUM, and subqueries in the same query."
-    )
+    return text + "\n\n" + "\n".join(notes)
 
 
 def enhance_for_answer(question):
@@ -312,8 +395,10 @@ def parse_chat_request(data):
         data = {}
 
     message = str(data.get("message") or "")
-    confirmed_surname = data.get("confirmed_surname")
-    confirmed_customer_id = data.get("confirmed_customer_id")
+    confirmed_username = data.get("confirmed_username") or data.get("confirmed_surname")
+    confirmed_employee_id = (
+        data.get("confirmed_employee_id") or data.get("confirmed_customer_id")
+    )
 
     history = []
     raw_history = data.get("history")
@@ -329,12 +414,12 @@ def parse_chat_request(data):
     return (
         message,
         history,
-        str(confirmed_surname) if confirmed_surname else None,
-        str(confirmed_customer_id) if confirmed_customer_id else None,
+        str(confirmed_username) if confirmed_username else None,
+        str(confirmed_employee_id) if confirmed_employee_id else None,
     )
 
 
-def format_for_prompt(question, history, confirmed_surname=None, confirmed_customer_id=None):
+def format_for_prompt(question, history, confirmed_username=None, confirmed_employee_id=None):
     lines = []
     if history:
         lines.append("Conversation so far:")
@@ -344,15 +429,15 @@ def format_for_prompt(question, history, confirmed_surname=None, confirmed_custo
 
     lines.append(f"Current question: {question}" if lines else question)
 
-    if confirmed_customer_id:
+    if confirmed_employee_id:
         lines.append(
-            f"The user confirmed they mean CustomerId exactly: {confirmed_customer_id}. "
-            "Use WHERE CustomerId = that exact value."
+            f"The user confirmed they mean employeeid exactly: {confirmed_employee_id}. "
+            "Use WHERE employeeid = that exact value."
         )
-    elif confirmed_surname:
+    elif confirmed_username:
         lines.append(
-            f"The user confirmed they mean customer with Surname exactly: {confirmed_surname}. "
-            "Use WHERE Surname = that exact value (not LIKE)."
+            f"The user confirmed they mean employee with userName exactly: {confirmed_username}. "
+            "Use WHERE userName = that exact value (not LIKE)."
         )
 
     return "\n".join(lines)
@@ -410,14 +495,40 @@ def extract_sql_query(raw):
     except ValueError:
         pass
 
-    match = re.search(r"\bSELECT\b[\s\S]+", raw, re.IGNORECASE)
-    if match:
-        return match.group(0).strip().rstrip(";")
+    # Prefer a full CTE (WITH ... SELECT) over the first inner SELECT.
+    with_match = re.search(r"(?:^|;)\s*(WITH\b[\s\S]+)", raw, re.IGNORECASE)
+    select_match = re.search(r"\bSELECT\b[\s\S]+", raw, re.IGNORECASE)
+
+    if with_match and select_match and with_match.start() <= select_match.start():
+        return with_match.group(1).strip().rstrip(";")
+    if select_match:
+        return select_match.group(0).strip().rstrip(";")
+    if with_match:
+        return with_match.group(1).strip().rstrip(";")
 
     return raw
 
 
-def clean_sql(sql, actual_table_name="Customers"):
+def normalize_readonly_sql(sql):
+    """Strip leading noise that SQL Server models often add before a SELECT/WITH."""
+    if not sql:
+        return sql
+
+    sql = sql.strip().lstrip(";").strip()
+    # Drop leading USE / SET lines (e.g. SET NOCOUNT ON) before the real query.
+    while True:
+        match = re.match(
+            r"^(?:USE\b[^;\n]*|SET\b[^;\n]*);?\s*",
+            sql,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            break
+        sql = sql[match.end():].lstrip(";").strip()
+    return sql
+
+
+def clean_sql(sql, actual_table_name="EmployeeAttendance"):
     if not sql or not sql.strip():
         return "NA"
 
@@ -430,19 +541,20 @@ def clean_sql(sql, actual_table_name="Customers"):
         .strip()
         .rstrip(";")
     )
-    sql = fix_surname_prefix_match(fix_customers_schema(sql, actual_table_name))
-    return convert_limit_to_top(sql)
+    sql = normalize_readonly_sql(sql)
+    sql = fix_username_prefix_match(fix_workforce_schema(sql, actual_table_name))
+    sql = convert_limit_to_top(sql)
+    return ensure_single_readonly_sql(sql)
 
-
-def fix_surname_prefix_match(sql):
+def fix_username_prefix_match(sql):
     sql = re.sub(
-        r"(\bSurname\b)\s+LIKE\s+(['\"])%([^'\"%]+)%\2",
+        r"(\buserName\b)\s+LIKE\s+(['\"])%([^'\"%]+)%\2",
         r"\1 LIKE \2\3%\2",
         sql,
         flags=re.IGNORECASE,
     )
     sql = re.sub(
-        r"(\bSurname\b)\s+LIKE\s+(['\"])%([^'\"%]+)\2",
+        r"(\buserName\b)\s+LIKE\s+(['\"])%([^'\"%]+)\2",
         r"\1 LIKE \2\3%\2",
         sql,
         flags=re.IGNORECASE,
@@ -450,31 +562,52 @@ def fix_surname_prefix_match(sql):
     return sql
 
 
-def fix_customers_schema(sql, actual_table_name):
-    table_name = actual_table_name or "Customers"
+def fix_workforce_schema(sql, actual_table_name):
+    table_name = actual_table_name or "EmployeeAttendance"
 
     sql = re.sub(
-        r"(`?|\[?)(?:bank_data\.)?(?:dbo\.)?customers(`?|\]?)",
+        r"(`?|\[?)(?:bank_data\.)?(?:dbo\.)?(?:customers|employeeattendance|employee_sessions|employees)(`?|\]?)",
         lambda match: f"{match.group(1)}{table_name}{match.group(2)}",
         sql,
         flags=re.IGNORECASE,
     )
 
     columns = {
-        "customerid": "CustomerId",
-        "surname": "Surname",
-        "creditscore": "CreditScore",
-        "geography": "Geography",
-        "gender": "Gender",
-        "age": "Age",
-        "tenure": "Tenure",
-        "balance": "Balance",
-        "numofproducts": "NumOfProducts",
-        "hascrcard": "HasCrCard",
-        "isactivemember": "IsActiveMember",
-        "estimatedsalary": "EstimatedSalary",
-        "exited": "Exited",
-        "rownumber": "RowNumber",
+        "employeeid": "employeeid",
+        "customerid": "employeeid",
+        "username": "userName",
+        "surname": "userName",
+        "location": "location",
+        "shiftname": "shiftName",
+        "sessiondate": "sessionDate",
+        "firstlogin": "firstLogin",
+        "lastlogin": "lastLogin",
+        "logged_hours": "logged_hours",
+        "loggedhours": "logged_hours",
+        "firstswipein": "firstSwipeIn",
+        "lastswipeout": "lastSwipeOut",
+        "late_login": "late_login",
+        "latelogin": "late_login",
+        "latelogincomment": "lateLoginComment",
+        "earlylogoutcomment": "earlyLogoutComment",
+        "aafsconferencecall": "aafsConferenceCall",
+        "aafstraining": "aafsTraining",
+        "aafsmeeting": "aafsMeeting",
+        "aafsworkreview": "aafsWorkReview",
+        "aafsunknowntafs": "aafsUnknownTafs",
+        "aafsitdesksupport": "aafsItDeskSupport",
+        "aafsteammeeting": "aafsTeamMeeting",
+        "aafsofficefunactivity": "aafsOfficefunactivity",
+        "aafsdocumentmgmt": "aafsDocumentMgmt",
+        "aafssalescall": "aafsSalesCall",
+        "aafsnamesonboard": "aafsNamesOnBoard",
+        "aafsondesksupport": "aafsOnDeskSupport",
+        "aafbaqhseq": "aafBaqHseq",
+        "aafsinterview": "aafsInterview",
+        "aafsbreak": "aafsBreak",
+        "aafslunchbreak": "aafsLunchBreak",
+        "aafsshortbreak": "aafsShortBreak",
+        "aafspersonaltime": "aafsPersonalTime",
     }
 
     for pattern, replacement in columns.items():
@@ -515,14 +648,100 @@ def strip_comments(sql):
     return sql.strip()
 
 
+def strip_string_literals(sql):
+    sql = re.sub(r"N?'(?:''|[^'])*'", "''", sql)
+    sql = re.sub(r'"(?:""|[^"])*"', '""', sql)
+    return sql
+
+
+def split_sql_statements(sql):
+    """Split on semicolons that are outside string literals."""
+    parts = []
+    buffer = []
+    in_single_quote = False
+    index = 0
+    while index < len(sql):
+        char = sql[index]
+        if in_single_quote:
+            buffer.append(char)
+            if char == "'":
+                if index + 1 < len(sql) and sql[index + 1] == "'":
+                    buffer.append(sql[index + 1])
+                    index += 2
+                    continue
+                in_single_quote = False
+            index += 1
+            continue
+
+        if char == "'":
+            in_single_quote = True
+            buffer.append(char)
+            index += 1
+            continue
+
+        if char == ";":
+            piece = "".join(buffer).strip()
+            if piece:
+                parts.append(piece)
+            buffer = []
+            index += 1
+            continue
+
+        buffer.append(char)
+        index += 1
+
+    piece = "".join(buffer).strip()
+    if piece:
+        parts.append(piece)
+    return parts
+
+
+def ensure_single_readonly_sql(sql):
+    """
+    Models often emit WITH ...; SELECT ..., SET + SELECT, or a second SELECT.
+    Keep one read-only statement instead of blocking the whole request.
+    """
+    if not sql or not sql.strip():
+        return sql
+
+    stripped = normalize_readonly_sql(strip_comments(sql.strip().rstrip(";")))
+    parts = split_sql_statements(stripped)
+    if not parts:
+        return stripped
+
+    merged = []
+    index = 0
+    while index < len(parts):
+        part = parts[index]
+        next_part = parts[index + 1] if index + 1 < len(parts) else None
+        if (
+            part.upper().startswith("WITH")
+            and next_part
+            and re.match(r"^\s*SELECT\b", next_part, re.IGNORECASE)
+        ):
+            merged.append(f"{part} {next_part}")
+            index += 2
+            continue
+        merged.append(part)
+        index += 1
+
+    for part in merged:
+        upper = part.lstrip().upper()
+        if upper.startswith("SELECT") or upper.startswith("WITH") or upper.startswith("("):
+            return part.strip()
+
+    return merged[0].strip()
+
+
 def validate_select_query(sql):
     if not sql or not sql.strip():
         return False, "Query is empty."
 
-    stripped = strip_comments(sql.strip().rstrip(";"))
-    if ";" in stripped:
-        return False, "Multiple SQL statements are not allowed."
+    stripped = ensure_single_readonly_sql(sql)
+    if not stripped:
+        return False, "Query is empty."
 
+    keyword_scan = strip_string_literals(stripped)
     for keyword in (
         "INSERT",
         "UPDATE",
@@ -537,20 +756,21 @@ def validate_select_query(sql):
         "GRANT",
         "REVOKE",
     ):
-        if re.search(rf"\b{keyword}\b", stripped, re.IGNORECASE):
+        if re.search(rf"\b{keyword}\b", keyword_scan, re.IGNORECASE):
             return False, f"Blocked keyword detected: {keyword}."
 
-    if re.search(r"\bSELECT\b[\s\S]+\bINTO\b", stripped, re.IGNORECASE):
+    # Allow "SELECT ... FROM ... INTO" only when it is SELECT INTO (write).
+    if re.search(r"\bSELECT\b[\s\S]*?\bINTO\b\s+[\#\[]?\w+", keyword_scan, re.IGNORECASE):
         return False, "SELECT INTO is not allowed."
 
-    if stripped.upper().startswith("SELECT"):
+    upper = stripped.upper()
+    if upper.startswith("SELECT") or upper.startswith("("):
         return True, ""
 
-    if stripped.upper().startswith("WITH") and re.search(r"\bSELECT\b", stripped, re.IGNORECASE):
+    if upper.startswith("WITH") and re.search(r"\bSELECT\b", stripped, re.IGNORECASE):
         return True, ""
 
     return False, "Only read-only SELECT queries are allowed."
-
 
 def make_json_value(value):
     if isinstance(value, Decimal):
@@ -576,7 +796,7 @@ def user_requested_specific_row_count(question):
     text = question or ""
     if re.search(r"\b(top|bottom|first|last)\s+\d+\b", text, re.IGNORECASE):
         return True
-    if re.search(r"\b\d+\s+(rows|records|results|customers|people)\b", text, re.IGNORECASE):
+    if re.search(r"\b\d+\s+(rows|records|results|employees|people)\b", text, re.IGNORECASE):
         return True
     if re.search(r"\blimit\s+\d+\b", text, re.IGNORECASE):
         return True
@@ -604,56 +824,155 @@ def get_candidates(results):
         return []
 
     keys = [key for row in results for key in row.keys()]
-    surname_key = next((key for key in keys if key.lower() == "surname"), None)
-    if not surname_key:
+    username_key = next(
+        (key for key in keys if key.lower() in {"username", "surname", "name"}),
+        None,
+    )
+    if not username_key:
         return []
 
-    customer_id_key = next((key for key in keys if key.lower() == "customerid"), None)
+    employee_id_key = next(
+        (key for key in keys if key.lower() in {"employeeid", "customerid", "id"}),
+        None,
+    )
     seen = set()
     candidates = []
 
     for row in results:
-        surname = row.get(surname_key)
-        if not surname:
+        username = row.get(username_key)
+        if not username:
             continue
 
-        customer_id = row.get(customer_id_key) if customer_id_key else None
-        dedupe_key = str(customer_id) if customer_id is not None else str(surname).lower()
+        employee_id = row.get(employee_id_key) if employee_id_key else None
+        dedupe_key = str(employee_id) if employee_id is not None else str(username).lower()
         if dedupe_key in seen:
             continue
 
         seen.add(dedupe_key)
-        candidates.append({"customer_id": customer_id, "surname": str(surname)})
+        candidates.append({"employee_id": employee_id, "username": str(username)})
 
-    return sorted(candidates, key=lambda c: (c["surname"].lower(), str(c["customer_id"])))
+    return sorted(candidates, key=lambda c: (c["username"].lower(), str(c["employee_id"])))
 
 
-def should_confirm(candidates, question, confirmed_customer_id):
-    if confirmed_customer_id:
+def sql_literal(value):
+    return str(value).replace("'", "''")
+
+
+def extract_name_hints(question):
+    """Pull likely first/last name tokens from a question."""
+    text = question or ""
+    text = re.sub(r"\b20\d{2}\b", " ", text)
+    text = re.sub(r"\b\d{1,2}[/-]\d{1,2}([/-]\d{2,4})?\b", " ", text)
+    text = re.sub(r"[`\"“”]", " ", text)
+
+    tokens = re.findall(r"[A-Za-z][A-Za-z'.-]*", text)
+    hints = []
+    seen = set()
+    for token in tokens:
+        cleaned = token.strip(".'-")
+        key = cleaned.lower()
+        if len(cleaned) < 2 or key in NAME_STOPWORDS or key in seen:
+            continue
+        seen.add(key)
+        hints.append(cleaned)
+        if len(hints) >= 4:
+            break
+    return hints
+
+
+def find_matching_employees(table_name, name_hints, limit=20):
+    """Match employees by first name, last name, or both against userName."""
+    if not table_name or not name_hints:
+        return []
+
+    where_parts = [
+        f"userName LIKE '%{sql_literal(hint)}%'"
+        for hint in name_hints
+    ]
+    where_sql = " AND ".join(where_parts)
+    if len(name_hints) >= 2:
+        ordered = "%" + "%".join(sql_literal(hint) for hint in name_hints) + "%"
+        where_sql = f"(({where_sql}) OR userName LIKE '{ordered}')"
+
+    sql = f"""
+        SELECT DISTINCT TOP ({int(limit)})
+            userName AS username,
+            employeeid AS employee_id
+        FROM [{table_name}]
+        WHERE {where_sql}
+        ORDER BY userName, employeeid
+    """
+
+    try:
+        rows = execute_sql(sql)
+    except Exception:
+        sql = f"""
+            SELECT DISTINCT TOP ({int(limit)})
+                userName AS username
+            FROM [{table_name}]
+            WHERE {where_sql}
+            ORDER BY userName
+        """
+        try:
+            rows = execute_sql(sql)
+        except Exception:
+            return []
+
+    seen = set()
+    matches = []
+    for row in rows:
+        username = str(row.get("username") or "").strip()
+        if not username:
+            continue
+        employee_id = row.get("employee_id")
+        dedupe_key = f"{username.lower()}::{employee_id}"
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        matches.append({"username": username, "employee_id": employee_id})
+    return matches
+
+
+def resolve_employee_from_question(question, table_name, confirmed_username, confirmed_employee_id):
+    """
+    Resolve a person mentioned by first name, last name, or both.
+    Returns (confirmed_username, confirmed_employee_id, candidates_needing_confirmation).
+    """
+    if confirmed_employee_id or confirmed_username:
+        return confirmed_username, confirmed_employee_id, []
+
+    hints = extract_name_hints(question)
+    if not hints:
+        return None, None, []
+
+    matches = find_matching_employees(table_name, hints)
+    if not matches and len(hints) > 1:
+        matches = find_matching_employees(table_name, [hints[0]])
+
+    if len(matches) == 1:
+        match = matches[0]
+        employee_id = match.get("employee_id")
+        return (
+            match.get("username"),
+            str(employee_id) if employee_id is not None else None,
+            [],
+        )
+
+    if len(matches) > 1:
+        return None, None, matches
+
+    return None, None, []
+
+
+def should_confirm(candidates, question, confirmed_employee_id, confirmed_username=None):
+    if confirmed_employee_id or confirmed_username:
         return False
     if len(candidates) <= 1:
         return False
     if COMPARISON_PATTERN.search(question or ""):
         return False
-    if LISTING_PATTERN.search(question or ""):
-        return False
-
-    surname_counts = {}
-    for candidate in candidates:
-        surname = str(candidate.get("surname") or "").strip().lower()
-        if surname:
-            surname_counts[surname] = surname_counts.get(surname, 0) + 1
-
-    duplicate_surnames = [
-        surname
-        for surname, count in surname_counts.items()
-        if count > 1
-    ]
-    question_text = question or ""
-    return any(
-        re.search(rf"\b{re.escape(surname)}\b", question_text, re.IGNORECASE)
-        for surname in duplicate_surnames
-    )
+    # Only ask when the question appears to name a person.
+    return bool(extract_name_hints(question))
 
 
 def wants_chart(question):
@@ -685,9 +1004,9 @@ def is_chart_followup(question):
         "can",
         "chart",
         "charts",
-        "customer",
-        "customers",
         "diagram",
+        "employee",
+        "employees",
         "graph",
         "graphs",
         "it",
@@ -770,7 +1089,7 @@ def summarize_last_result(last_result):
 
     if people:
         parts.append(
-            "Previous people/customers: "
+            "Previous people/employees: "
             + json.dumps(people[:20], default=str)
         )
     if memory.get("label_column"):
@@ -783,8 +1102,8 @@ def summarize_last_result(last_result):
         parts.append(f"Previous chart type: {last_result['chart_type']}")
     if people:
         parts.append(
-            "If the user says they, them, their, those customers, or those people, "
-            "treat that as referring to the previous people/customers listed above."
+            "If the user says they, them, their, those employees, or those people, "
+            "treat that as referring to the previous people/employees listed above."
         )
 
     return "\n".join(part for part in parts if part.strip())
@@ -890,7 +1209,25 @@ def build_chart_followup_response(question, last_result):
     }
 
 
-def generate_sql(question, history, customers_table, confirmed_surname, confirmed_customer_id):
+def current_date_context():
+    today = date.today()
+    month_start = today.replace(day=1)
+    if today.month == 12:
+        next_month = date(today.year + 1, 1, 1)
+    else:
+        next_month = date(today.year, today.month + 1, 1)
+
+    return (
+        f"Today's date is {today.isoformat()} ({today.strftime('%A')}). "
+        f"Current month is {today.strftime('%B %Y')}. "
+        f"\"This month\" means sessionDate >= '{month_start.isoformat()}' "
+        f"AND sessionDate < '{next_month.isoformat()}'. "
+        "Relative dates like today/yesterday/this week/this month MUST use this date, "
+        "not an assumed year."
+    )
+
+
+def generate_sql(question, history, primary_table, confirmed_username, confirmed_employee_id):
     schema_text = schema_provider.get_schema_text()
     instructions_text = load_text_file("instructions.txt")
     samples_text = load_text_file("sample_queries.txt")
@@ -898,18 +1235,36 @@ def generate_sql(question, history, customers_table, confirmed_surname, confirme
     prompt_question = format_for_prompt(
         enhanced_question,
         history,
-        confirmed_surname,
-        confirmed_customer_id,
+        confirmed_username,
+        confirmed_employee_id,
     )
 
+    table_hint = (
+        f"\n\nPrimary table to query when unsure: [{primary_table}]"
+        if primary_table
+        else ""
+    )
+    date_hint = current_date_context()
+
     raw = get_openai_completion(
-        system_prompt=f"{instructions_text}\n\nDatabase Schema:\n{schema_text}\n\nExample Queries:\n{samples_text}",
+        system_prompt=(
+            f"{instructions_text}\n\nDatabase Schema:\n{schema_text}\n\n"
+            f"Example Queries:\n{samples_text}{table_hint}\n\n"
+            f"{date_hint}\n\n"
+            "Return ONLY one read-only SQL Server query. "
+            "It must be a single SELECT or WITH ... SELECT statement. "
+            "No markdown, no explanation, no USE/SET/INSERT/UPDATE/DELETE. "
+            "Duration columns like logged_hours and aafs* breaks are often VARCHAR 'HH:MM:SS'. "
+            "Never COALESCE them with 0 or AVG them directly. Convert to seconds with "
+            "DATEDIFF(SECOND, 0, TRY_CAST(... AS TIME)) before AVG/SUM/addition. "
+            "If the user asks for an average, the SQL MUST include AVG(...) and GROUP BY when needed."
+        ),
         user_prompt=prompt_question,
     )
     return extract_sql_query(raw)
 
 
-def generate_answer(question, history, results, confirmed_surname, confirmed_customer_id):
+def generate_answer(question, history, results, confirmed_username, confirmed_employee_id):
     enhanced_question = enhance_for_answer(question)
     if is_large_result_question(question, results):
         return build_compact_result_answer(question, results), recommend_chart(results, "table", question)
@@ -917,12 +1272,12 @@ def generate_answer(question, history, results, confirmed_surname, confirmed_cus
     prompt_question = format_for_prompt(
         enhanced_question,
         history,
-        confirmed_surname,
-        confirmed_customer_id,
+        confirmed_username,
+        confirmed_employee_id,
     )
     raw_answer = get_openai_completion(
         system_prompt=(
-            "You are a helpful data analyst. Summarize query results as a clear, "
+            "You are a helpful workforce data analyst for IRI. Summarize query results as a clear, "
             "concise answer. Include notable insights. Your response will be shown "
             "in a web chat interface. Do not list rows one by one, do not use markdown "
             "tables, and do not repeat every field from the data. The UI already shows "
@@ -942,11 +1297,11 @@ def is_large_result_question(question, results):
 def build_compact_result_answer(question, results):
     row_count = len(results)
     first_row = results[0] if results else {}
-    has_customer_fields = any(
-        key.lower() in {"customerid", "surname"}
+    has_employee_fields = any(
+        key.lower() in {"employeeid", "username"}
         for key in first_row.keys()
     )
-    noun = "customer" if has_customer_fields else "row"
+    noun = "employee" if has_employee_fields else "row"
     noun = noun if row_count == 1 else f"{noun}s"
 
     if wants_chart(question) or requested_chart_type(question):
@@ -1030,7 +1385,7 @@ def test_sql_connection():
 @app.route("/api/AskQuestion", methods=["POST"])
 def ask_question():
     payload = request.get_json(silent=True) or {}
-    question, history, confirmed_surname, confirmed_customer_id = parse_chat_request(payload)
+    question, history, confirmed_username, confirmed_employee_id = parse_chat_request(payload)
     last_result = parse_last_result(payload)
 
     if not question.strip():
@@ -1053,36 +1408,63 @@ def ask_question():
 
     try:
         history = add_result_context_to_history(history, last_result)
-        customers_table = schema_provider.get_customers_table_name()
-        if not customers_table:
+        primary_table = schema_provider.get_primary_table_name()
+        if not primary_table:
             tables = schema_provider.list_tables()
             return jsonify(
                 {
-                    "answer": "I can't find a Customers table in bank_data. Create/import your data first, then try again.",
-                    "error": "No tables found in bank_data."
+                    "answer": (
+                        "I can't find any tables in the connected SQL Server database. "
+                        "Confirm the connection points at the right database, then try again."
+                    ),
+                    "error": "No tables found in the connected database."
                     if not tables
                     else f"Tables found: {', '.join(tables)}",
+                }
+            )
+
+        confirmed_username, confirmed_employee_id, name_matches = resolve_employee_from_question(
+            question,
+            primary_table,
+            confirmed_username,
+            confirmed_employee_id,
+        )
+        if name_matches:
+            hint_text = " ".join(extract_name_hints(question)) or "that name"
+            return jsonify(
+                {
+                    "query": "",
+                    "answer": (
+                        f'I found {len(name_matches)} people matching "{hint_text}". '
+                        "Which one did you mean?"
+                    ),
+                    "needs_confirmation": True,
+                    "candidates": name_matches,
+                    "data": [],
+                    "chart_type": "table",
                 }
             )
 
         sql_query = generate_sql(
             question,
             history,
-            customers_table,
-            confirmed_surname,
-            confirmed_customer_id,
+            primary_table,
+            confirmed_username,
+            confirmed_employee_id,
         )
-        sql_query = clean_sql(sql_query, customers_table)
+        sql_query = clean_sql(sql_query, primary_table)
         sql_query = remove_broad_query_limit(sql_query, question)
+        sql_query = ensure_single_readonly_sql(sql_query)
 
         if sql_query.upper() == "NA":
             return jsonify(
                 {
                     "query": "NA",
                     "answer": (
-                        "I couldn't map that question to your bank_data tables. Open "
-                        '/api/GetDatabaseSchema to see table and column names, then ask using those names - '
-                        'for example: "What is the credit score for customers named Hill?"'
+                        "I couldn't map that question to your workforce tables. Open "
+                        "/api/GetDatabaseSchema to see table and column names, then ask using those names - "
+                        'for example: "Who logged in late yesterday?" or '
+                        '"Show total break time for employees in Toronto this week."'
                     ),
                     "data": [],
                     "chart_type": "table",
@@ -1102,11 +1484,15 @@ def ask_question():
 
         results = execute_sql(sql_query)
         candidates = get_candidates(results)
-        if should_confirm(candidates, question, confirmed_customer_id):
+        if should_confirm(candidates, question, confirmed_employee_id, confirmed_username):
+            hint_text = " ".join(extract_name_hints(question)) or "that name"
             return jsonify(
                 {
                     "query": sql_query,
-                    "answer": f"I found {len(candidates)} matching customers. Which one did you mean?",
+                    "answer": (
+                        f'I found {len(candidates)} people matching "{hint_text}". '
+                        "Which one did you mean?"
+                    ),
                     "needs_confirmation": True,
                     "candidates": candidates,
                     "data": results,
@@ -1118,8 +1504,8 @@ def ask_question():
             question,
             history,
             results,
-            confirmed_surname,
-            confirmed_customer_id,
+            confirmed_username,
+            confirmed_employee_id,
         )
         chart_type = recommend_chart(results, chart_type, question)
 
@@ -1135,7 +1521,10 @@ def ask_question():
     except DATABASE_ERROR_TYPES as exc:
         return jsonify(
             {
-                "answer": "I couldn't run the database query. The table or column name may be wrong for your bank_data database.",
+                "answer": (
+                    "I couldn't run the database query. The table or column name may be wrong "
+                    "for your connected SQL Server database."
+                ),
                 "error": str(exc),
             }
         )

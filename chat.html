@@ -303,8 +303,8 @@
     <div class="row bot">
       <div class="avatar">AI</div>
       <div class="bubble" id="welcome">
-        Hi! I'm IRI AI. Ask questions about your connected database in plain English, and I'll answer in plain English too.
-        <div class="meta">Example: "How many rows are in customers?" — use your real table names from /api/GetDatabaseSchema</div>
+        Hi! I'm IRI AI. Ask questions about employee attendance, logins, breaks, AAFS, and shifts in plain English.
+        <div class="meta">Example: "Who logged in late yesterday?" or "Show total break time by employee this week"</div>
       </div>
     </div>
   </div>
@@ -332,12 +332,15 @@
       "#19c37d", "#5436da", "#3b82f6", "#f59e0b", "#ef4444",
       "#8b5cf6", "#14b8a6", "#ec4899", "#84cc16", "#06b6d4"
     ];
-    const ID_COLS = new Set(["customerid", "rownumber", "id"]);
+    const ID_COLS = new Set(["employeeid", "customerid", "rownumber", "id"]);
     const TABLE_PAGE_SIZE = 100;
-    const PREFERRED_LABELS = ["surname", "geography", "gender", "customername", "name"];
+    const PREFERRED_LABELS = [
+      "username", "surname", "location", "shiftname", "sessiondate", "name"
+    ];
     const PREFERRED_VALUES = [
-      "estimatedsalary", "salary", "balance", "creditscore", "age",
-      "count", "total", "average", "avg", "male", "female"
+      "logged_hours", "loggedhours", "aafsbreak", "aafslunchbreak",
+      "aafsshortbreak", "aafspersonaltime", "aafsmeeting", "aafstraining",
+      "aafsconferencecall", "count", "total", "average", "avg"
     ];
     const chartInstances = new Map();
 
@@ -846,17 +849,21 @@
     function renderConfirmButtons(candidates, originalQuestion) {
       if (!candidates || candidates.length === 0) return "";
       const buttons = candidates.map(candidate => {
-        const surname = typeof candidate === "string" ? candidate : candidate.surname;
-        const customerId = typeof candidate === "string" ? "" : candidate.customer_id;
-        const label = customerId
-          ? `${surname} (ID: ${customerId})`
-          : surname;
+        const username = typeof candidate === "string"
+          ? candidate
+          : (candidate.username || candidate.surname || "");
+        const employeeId = typeof candidate === "string"
+          ? ""
+          : (candidate.employee_id ?? candidate.customer_id ?? "");
+        const label = employeeId
+          ? `${username} (ID: ${employeeId})`
+          : username;
         return `
           <button type="button" class="name-pick"
-            data-surname="${escapeAttr(surname)}"
-            data-customer-id="${escapeAttr(customerId ?? "")}"
+            data-username="${escapeAttr(username)}"
+            data-employee-id="${escapeAttr(employeeId ?? "")}"
             data-question="${escapeAttr(originalQuestion)}">
-            ${escapeHtml(label)}
+            Did you mean ${escapeHtml(label)}?
           </button>
         `;
       }).join("");
@@ -870,14 +877,18 @@
       const labelCol = safeRows.length > 0 ? getLabelColumn(safeRows, valueCol) : null;
       const numericCols = safeRows.length > 0 ? getNumericColumns(safeRows[0]) : [];
 
-      const customerIdCol = columns.find(col => col.toLowerCase() === "customerid");
-      const surnameCol = columns.find(col => col.toLowerCase() === "surname");
+      const employeeIdCol = columns.find(col =>
+        ["employeeid", "customerid", "id"].includes(col.toLowerCase())
+      );
+      const usernameCol = columns.find(col =>
+        ["username", "surname", "name"].includes(col.toLowerCase())
+      );
       const people = safeRows.slice(0, 20)
         .map(row => ({
-          customer_id: customerIdCol ? row[customerIdCol] : null,
-          surname: surnameCol ? row[surnameCol] : null
+          employee_id: employeeIdCol ? row[employeeIdCol] : null,
+          username: usernameCol ? row[usernameCol] : null
         }))
-        .filter(person => person.customer_id !== null || person.surname);
+        .filter(person => person.employee_id !== null || person.username);
 
       return {
         question,
@@ -926,7 +937,7 @@
 
       row.querySelectorAll(".name-pick").forEach(btn => {
         btn.addEventListener("click", () => {
-          confirmCustomer(btn.dataset.question, btn.dataset.surname, btn.dataset.customerId);
+          confirmEmployee(btn.dataset.question, btn.dataset.username, btn.dataset.employeeId);
         });
       });
 
@@ -1022,7 +1033,7 @@
       input.style.height = `${Math.min(input.scrollHeight, 160)}px`;
     }
 
-    async function sendQuestion(text, confirmedSurname, confirmedCustomerId) {
+    async function sendQuestion(text, confirmedUsername, confirmedEmployeeId) {
       const history = chatHistory.slice(-8);
       send.disabled = true;
 
@@ -1035,8 +1046,8 @@
       try {
         const payload = { message: text, history };
         if (lastResultContext) payload.last_result = lastResultContext;
-        if (confirmedSurname) payload.confirmed_surname = confirmedSurname;
-        if (confirmedCustomerId) payload.confirmed_customer_id = String(confirmedCustomerId);
+        if (confirmedUsername) payload.confirmed_username = confirmedUsername;
+        if (confirmedEmployeeId) payload.confirmed_employee_id = String(confirmedEmployeeId);
 
         const res = await fetch(`${base}/api/AskQuestion`, {
           method: "POST",
@@ -1085,10 +1096,10 @@
       }
     }
 
-    async function confirmCustomer(originalQuestion, surname, customerId) {
-      const label = customerId ? `${surname} (ID: ${customerId})` : surname;
+    async function confirmEmployee(originalQuestion, username, employeeId) {
+      const label = employeeId ? `${username} (ID: ${employeeId})` : username;
       addUser(`Yes, ${label}`);
-      await sendQuestion(originalQuestion, surname, customerId);
+      await sendQuestion(originalQuestion, username, employeeId);
     }
 
     async function askQuestion() {
