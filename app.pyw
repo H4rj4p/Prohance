@@ -381,12 +381,18 @@ def enhance_for_sql(question):
 
 
 def enhance_for_answer(question):
+    base = (
+        "\n\nIMPORTANT: Answer in 1-2 short natural-language sentences only. "
+        "Example style: \"Akshay Soni averaged 32.5 logged hours this month.\" "
+        "Lead with the person, the metric, and the time period."
+    )
     if not is_multi_part(question):
-        return question
+        return (question or "") + base
 
     return (
-        question
-        + "\n\nIMPORTANT: Answer every part in 1-2 short lines total. Be terse."
+        (question or "")
+        + base
+        + " Cover every part of the question inside those 1-2 sentences."
     )
 
 
@@ -1266,26 +1272,55 @@ def generate_sql(question, history, primary_table, confirmed_username, confirmed
 
 def generate_answer(question, history, results, confirmed_username, confirmed_employee_id):
     enhanced_question = enhance_for_answer(question)
-    if is_large_result_question(question, results):
-        return build_compact_result_answer(question, results), recommend_chart(results, "table", question)
-
     prompt_question = format_for_prompt(
         enhanced_question,
         history,
         confirmed_username,
         confirmed_employee_id,
     )
-    raw_answer = get_openai_completion(
-        system_prompt=(
-            "You are a helpful workforce data analyst for IRI. Summarize query results as a clear, "
-            "concise answer. Include notable insights. Your response will be shown "
-            "in a web chat interface. Do not list rows one by one, do not use markdown "
-            "tables, and do not repeat every field from the data. The UI already shows "
-            "the rows in a table/chart, so keep the answer to a few sentences."
-        ),
-        user_prompt=f"{prompt_question}\n\nData: {json.dumps(results, default=str)}",
-    )
-    return raw_answer, recommend_chart(results, "table", question)
+
+    if not results:
+        return (
+            "I couldn't find any matching records for that question.",
+            "table",
+        )
+
+    # Keep the model focused on a short spoken answer; UI already shows the table.
+    preview_rows = results[:5]
+    extra = ""
+    if len(results) > 5:
+        extra = f"\nTotal rows returned: {len(results)}. Only the first 5 rows are shown above."
+
+    person_hint = ""
+    if confirmed_username:
+        person_hint = f"\nConfirmed employee full name: {confirmed_username}."
+
+    try:
+        raw_answer = get_openai_completion(
+            system_prompt=(
+                "You are IRI AI, a workforce data analyst. "
+                "Reply with ONLY 1-2 short natural-language sentences. "
+                "Lead with the direct answer in plain English, like: "
+                "\"Akshay Soni averaged 32.5 logged hours this month.\" "
+                "or \"Harzh Mevada's average total break in July 2026 was 00:45:12 across 18 sessions.\" "
+                "Include the person's full name when available, the key number or time, and the period asked about. "
+                "Do not use markdown, bullets, headings, or tables. "
+                "Do not list rows or repeat every column — the UI already shows the data table underneath. "
+                "If the data is empty, say no matching records were found. "
+                "Never invent values that are not in the data."
+            ),
+            user_prompt=(
+                f"{prompt_question}{person_hint}\n\n"
+                f"Data: {json.dumps(preview_rows, default=str)}{extra}"
+            ),
+        )
+        answer = " ".join(str(raw_answer or "").split()).strip()
+        if not answer:
+            answer = build_compact_result_answer(question, results)
+    except Exception:
+        answer = build_compact_result_answer(question, results)
+
+    return answer, recommend_chart(results, "table", question)
 
 
 def is_large_result_question(question, results):
@@ -1297,17 +1332,31 @@ def is_large_result_question(question, results):
 def build_compact_result_answer(question, results):
     row_count = len(results)
     first_row = results[0] if results else {}
-    has_employee_fields = any(
-        key.lower() in {"employeeid", "username"}
-        for key in first_row.keys()
-    )
-    noun = "employee" if has_employee_fields else "row"
-    noun = noun if row_count == 1 else f"{noun}s"
+    username = None
+    for key, value in first_row.items():
+        if key.lower() in {"username", "surname", "name"} and value:
+            username = str(value)
+            break
 
-    if wants_chart(question) or requested_chart_type(question):
-        return f"I found {row_count} matching {noun}."
+    # Prefer a simple spoken fallback using the first row's main metric.
+    metric_parts = []
+    for key, value in first_row.items():
+        if key.lower() in {"username", "surname", "name", "employeeid", "id"}:
+            continue
+        if value is None or value == "":
+            continue
+        metric_parts.append(f"{key.replace('_', ' ')} {value}")
+        if len(metric_parts) >= 2:
+            break
 
-    return f"I found {row_count} matching {noun}."
+    who = username or "The matching employee"
+    if metric_parts and row_count == 1:
+        return f"{who} has {', '.join(metric_parts)}."
+    if username and row_count > 1:
+        return f"I found {row_count} matching records for {username}."
+    if row_count == 0:
+        return "I couldn't find any matching records for that question."
+    return f"I found {row_count} matching records."
 
 
 @app.route("/api/Chat", methods=["GET"])
