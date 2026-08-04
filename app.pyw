@@ -629,7 +629,9 @@ def enhance_for_sql(question):
 def enhance_for_answer(question):
     base = (
         "\n\nIMPORTANT: Answer in 1-2 short natural-language sentences only. "
-        "Example style: \"Akshay Soni averaged 32.5 logged hours this month.\" "
+        "Example style: \"Akshay Soni logged 1 week 2 days and 3 hours in July.\" "
+        "When a duration field is present, use that exact human wording "
+        "(days/weeks/hours/minutes), not HH:MM:SS clock time. "
         "Lead with the person, the metric, and the time period."
     )
     if not is_multi_part(question):
