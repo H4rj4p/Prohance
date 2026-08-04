@@ -2834,7 +2834,10 @@ def generate_sql(
             "In CR_HireMaster: PLACEMENTDATE = offer/placement date; "
             "STARTDATE = date they started work. Never swap them.\n"
             "Never default to CR_HireMaster when the question did not say "
-            "hire/offer/placement/start date."
+            "hire/offer/placement/start date.\n"
+            "Named people are always the recruiter/user — never filter candidate name columns.\n"
+            "If the question asks how many submittals/interviews/hires/rejects, "
+            "return SELECT COUNT(*) from that ONE table only (no UNION, no detail rows)."
         )
     else:
         instructions_text = load_text_file("instructions.txt")
