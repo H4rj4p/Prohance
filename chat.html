@@ -1079,9 +1079,7 @@
       try {
         const payload = { message: text, history };
         // New named person → drop prior result memory so old filters are not reused.
-        if (lastResultContext && !looksLikeNewPersonQuestion(text)) {
-          payload.last_result = lastResultContext;
-        } else if (looksLikeNewPersonQuestion(text)) {
+        if (looksLikeNewPersonQuestion(text)) {
           lastResultContext = null;
         } else if (lastResultContext) {
           payload.last_result = lastResultContext;
