@@ -422,7 +422,8 @@ NAME_STOPWORDS = {
     "is", "are", "was", "were", "be", "been", "being", "am",
     "what", "whats", "who", "whose", "whom", "which", "when", "where", "why", "how",
     "many", "much", "avg", "average", "mean", "total", "sum", "count", "number",
-    "logged", "hours", "hour", "break", "breaks", "lunch", "personal", "time", "times",
+    "logged", "log", "logs", "logging", "hours", "hour",
+    "break", "breaks", "lunch", "personal", "time", "times",
     "login", "logins", "logout", "late", "early", "shift", "shifts", "location",
     "locations", "session", "sessions", "attendance", "activity", "activities",
     "today", "yesterday", "tomorrow", "this", "that", "these", "those", "last", "next",
@@ -1458,11 +1459,33 @@ def sql_literal(value):
     return str(value).replace("'", "''")
 
 
+# Verbs / question words that end a person-name span.
+_NAME_TAIL_VERBS = (
+    r"make|made|makes|making|get|got|gets|getting|give|gave|gave|"
+    r"log|logs|logged|logging|work|works|worked|working|"
+    r"have|has|had|submit|submits|submitted|hire|hired|recruit|recruited|"
+    r"show|list|tell|do|does|did|is|are|was|were|can|could|would|should|"
+    r"spend|spent|take|took|use|used"
+)
+_NAME_MONTHS = (
+    r"january|february|march|april|may|june|july|august|september|october|"
+    r"november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec|"
+    r"today|yesterday|tomorrow|this|last|next|week|month|year"
+)
+_NAME_TOKEN = r"[A-Za-z][A-Za-z'.-]*"
+_NAME_SPAN = rf"({_NAME_TOKEN}(?:\s+{_NAME_TOKEN}){{0,2}})"
+
+
 def extract_name_hints(question):
     """
     Pull likely first/last name tokens from a question.
-    Prefer explicit patterns like "candidate John Smith" / "did Jordan make"
-    so verbs like "made" and words like "date" are never treated as names.
+
+    Priority:
+    1) Leading name: "Akshay Soni, how many hours..."
+    2) Role marker: "candidate/employee/recruiter Akshay Soni"
+    3) "did <Name> log/make..." / "how many ... did <Name> log..."
+    4) "for <Name>" / "for candidate <Name>"
+    Never treat verbs like log/made or months like July as names.
     """
     text = question or ""
     text = re.sub(r"\b20\d{2}\b", " ", text)
@@ -1472,13 +1495,14 @@ def extract_name_hints(question):
     def clean_name_parts(raw):
         parts = []
         seen = set()
-        for token in re.findall(r"[A-Za-z][A-Za-z'.-]*", raw or ""):
+        for token in re.findall(_NAME_TOKEN, raw or ""):
             cleaned = token.strip(".'-")
             key = cleaned.lower()
             if len(cleaned) < 2 or key in NAME_STOPWORDS or key in seen:
                 continue
-            # Adjectives like monthly/weekly are never names.
-            if key.endswith("ly") and key not in {"lily", "kelly", "holly", "emily", "hailey", "bailey"}:
+            if key.endswith("ly") and key not in {
+                "lily", "kelly", "holly", "emily", "hailey", "bailey",
+            }:
                 continue
             seen.add(key)
             parts.append(cleaned)
@@ -1486,33 +1510,37 @@ def extract_name_hints(question):
                 break
         return parts
 
-    # Prefer names right after role markers / "did NAME make" / "for", etc.
     patterned = [
-        # "how many submits did Jordan Lee make/get this month"
-        r"\bhow\s+many\s+[A-Za-z]+\s+did\s+"
-        r"([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,2})"
-        r"(?=\s+(?:make|made|get|got|have|had|in|this|last|for|during|on)\b)",
-        # "did Jordan make" / "has Priya got" / "have they submitted" (name form)
-        r"\b(?:did|has|have)\s+"
-        r"([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,2})\s+"
-        r"(?:make|made|get|got|have|had|submit|submitted|hire|hired|recruit|recruited)\b",
-        # "submits Jordan made" / "hires Priya got"
-        r"\b(?:submits?|submittals?|submissions?|hires?|interviews?|rejects?|"
-        r"clients?|placements?|offers?)\s+"
-        r"([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,2})\s+"
-        r"(?:make|made|get|got|had|have)\b",
-        r"\bcandidate(?:'s)?\s+([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,2})",
-        r"\bemployee(?:'s)?\s+([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,2})",
-        r"\brecruiter(?:'s)?\s+([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,2})",
-        r"\buser(?:'s)?\s+([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,2})",
-        r"\bfor\s+(?:candidate\s+|employee\s+|recruiter\s+|user\s+)?"
-        r"([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,2})"
-        r"(?=\s+(?:what|when|who|how|did|does|do|has|have|had|was|is|are|"
-        r"make|made|get|got|the|his|her|their|a|an|on|in|at|to|of|"
-        r"this|last|next|,|\?|$))",
-        r"\b(?:about|regarding)\s+([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,2})\b",
-        r"\b([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,1})(?:'s)?\s+"
-        r"(?:interview|submittal|submission|hire|pay\s*rate|logged|break|hours)\b",
+        # "Akshay Soni, how many hours..." / "Akshay Soni: show logged hours"
+        rf"^\s*{_NAME_SPAN}\s*[,:\-]\s*"
+        rf"(?:how|what|when|who|where|show|list|give|tell|did|does|can|could|"
+        rf"please|find|get)\b",
+        # "Akshay Soni how many hours did he log"
+        rf"^\s*{_NAME_SPAN}\s+"
+        rf"(?:how|what|when|who|where)\b",
+        # role markers — name is the next word(s)
+        rf"\b(?:candidate|employee|recruiter|user)(?:'s)?\s+{_NAME_SPAN}\b",
+        # "for candidate Akshay Soni" / "for employee John"
+        rf"\bfor\s+(?:candidate|employee|recruiter|user)\s+{_NAME_SPAN}\b",
+        # "how many hours/submits did Akshay Soni log/make"
+        rf"\bhow\s+many\s+{_NAME_TOKEN}\s+did\s+{_NAME_SPAN}\s+"
+        rf"(?:{_NAME_TAIL_VERBS})\b",
+        # "did Akshay Soni log" / "has Priya made"
+        rf"\b(?:did|has|have)\s+{_NAME_SPAN}\s+(?:{_NAME_TAIL_VERBS})\b",
+        # "submits Jordan made" / "hours Akshay logged"
+        rf"\b(?:submits?|submittals?|submissions?|hires?|interviews?|rejects?|"
+        rf"clients?|placements?|offers?|hours?)\s+{_NAME_SPAN}\s+"
+        rf"(?:{_NAME_TAIL_VERBS})\b",
+        # "for Akshay Soni" but not "for July" / "for this month"
+        rf"\bfor\s+(?!{_NAME_MONTHS}\b){_NAME_SPAN}"
+        rf"(?=\s+(?:how|what|when|who|did|does|do|has|have|had|was|is|are|"
+        rf"{_NAME_TAIL_VERBS}|the|his|her|their|a|an|on|in|at|to|of|"
+        rf"this|last|next|,|\?|$))",
+        rf"\b(?:about|regarding)\s+{_NAME_SPAN}\b",
+        # "Akshay's logged hours" / "Jordan's submittal"
+        rf"\b{_NAME_SPAN}(?:'s)?\s+"
+        rf"(?:interview|submittal|submission|hire|pay\s*rate|logged|log|"
+        rf"break|hours|submits?)\b",
     ]
 
     for pattern in patterned:
@@ -1523,8 +1551,8 @@ def extract_name_hints(question):
         if parts:
             return parts
 
-    # Fallback: keep only up to two consecutive non-stopword tokens.
-    tokens = re.findall(r"[A-Za-z][A-Za-z'.-]*", text)
+    # Fallback: first 1–2 consecutive non-stopword tokens (usually the leading name).
+    tokens = re.findall(_NAME_TOKEN, text)
     hints = []
     seen = set()
     for token in tokens:
@@ -1534,7 +1562,10 @@ def extract_name_hints(question):
             len(cleaned) < 2
             or key in NAME_STOPWORDS
             or key in seen
-            or (key.endswith("ly") and key not in {"lily", "kelly", "holly", "emily", "hailey", "bailey"})
+            or (
+                key.endswith("ly")
+                and key not in {"lily", "kelly", "holly", "emily", "hailey", "bailey"}
+            )
         ):
             if hints:
                 break
@@ -1550,7 +1581,7 @@ def extract_name_hints(question):
 def looks_like_person_question(question):
     """
     Only run person lookup when the question actually seems to name someone.
-    Avoid treating words like "monthly" / "made" as people.
+    Avoid treating words like "monthly" / "made" / "log" as people.
     """
     text = question or ""
     if not text.strip():
@@ -1560,6 +1591,13 @@ def looks_like_person_question(question):
     if not hints:
         return False
 
+    # Any clear name cue — leading name, role marker, or 2-token name.
+    if re.search(
+        r"^\s*[A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,2}\s*[,:\-]",
+        text,
+    ):
+        return True
+
     if re.search(
         r"\b(?:candidate|employee|recruiter|user)(?:'s)?\s+[A-Za-z]",
         text,
@@ -1567,7 +1605,6 @@ def looks_like_person_question(question):
     ):
         return True
 
-    # Recruiter/performance questions still need a real extracted name.
     if is_recruiter_question(question):
         return True
 
@@ -1576,7 +1613,7 @@ def looks_like_person_question(question):
         text,
         re.IGNORECASE,
     ) and not re.search(
-        r"\bfor\s+(?:this|that|the|each|every|all|last|next|today|yesterday)\b",
+        rf"\bfor\s+(?:{_NAME_MONTHS})\b",
         text,
         re.IGNORECASE,
     ):
@@ -1587,8 +1624,15 @@ def looks_like_person_question(question):
 
     if len(hints) == 1:
         hint = hints[0]
-        # Single token counts only if written like a proper name (capitalized).
-        return bool(re.search(rf"\b{re.escape(hint)}\b", text) and hint[0].isupper())
+        # Single token: accept capitalized names, or lowercase if used with did/for.
+        if re.search(rf"\b{re.escape(hint)}\b", text) and hint[0].isupper():
+            return True
+        if re.search(
+            rf"\b(?:did|for|candidate|employee|recruiter)\s+{re.escape(hint)}\b",
+            text,
+            re.IGNORECASE,
+        ):
+            return True
 
     return False
 
