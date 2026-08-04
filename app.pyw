@@ -303,12 +303,17 @@ DATAVISTA_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# Prohance = attendance / time only. Keep this narrow on purpose.
+# Prohance = attendance / time only.
+# Include bare "hour(s)" / "log" / "logged" so questions like
+# "how many hour did he log for July" do not fall through to DataVista.
 PROHANCE_PATTERN = re.compile(
     r"\b("
     r"prohance|"
+    r"hours?|logged|logging|"
     r"logged\s*hours?|hours?\s*logged|hours?\s*worked|worked\s*hours?|"
     r"total\s*hours?|average\s*hours?|avg\s*hours?|"
+    r"(?:did|does|have|has)\s+(?:he|she|they)\s+log|log\s+for|"
+    r"\blog\b|"
     r"aafs|break(?:s)?|lunch\s*break|short\s*break|personal\s*time|"
     r"login|logout|first\s*login|last\s*logout|session\s*date|"
     r"attendance|shift(?:s)?|late\s*login|early\s*logout|swipe|"
@@ -343,14 +348,27 @@ def detect_question_domain(question):
     if re.search(r"\bprohance\b", text, re.IGNORECASE):
         return "prohance"
 
-    # Recruiting keywords win over attendance when both appear
-    # (e.g. "breaks between submits" is still a recruiting question).
-    if has_datavista:
-        return "datavista"
+    # If both match, prefer the stronger signal.
+    # Time/hours/log words beat weak overlap; clear recruiting words win otherwise.
+    if has_datavista and has_prohance:
+        # "hours" + "start date" etc.: recruiting date/pay/submit wins.
+        if re.search(
+            r"\b("
+            r"submit|submits|submittal|submission|interview|hire|hired|reject|"
+            r"placement|pay\s*rate|bill\s*rate|agreed\s*pay|candidate|client|"
+            r"recruiter|start\s*date|offer|pipeline"
+            r")\b",
+            text,
+            re.IGNORECASE,
+        ):
+            return "datavista"
+        return "prohance"
     if has_prohance:
         return "prohance"
+    if has_datavista:
+        return "datavista"
 
-    # Default: DataVista. Prohance only when attendance/time keywords are present.
+    # Default: DataVista for non-attendance questions.
     return "datavista"
 
 
@@ -2944,6 +2962,7 @@ def ask_question():
         )
 
     sql_query = ""
+    domain = "prohance"
     try:
         history = add_result_context_to_history(history, last_result)
         primary_table = schema_provider.get_primary_table_name()
@@ -3103,22 +3122,33 @@ def ask_question():
         )
     except DATABASE_ERROR_TYPES as exc:
         detail = str(exc)
-        hint = (
-            "Common DataVista fixes: use SUBMITTALDATE (not SubmitDate), "
-            "PRIMARYRECRUITERNAME, and TRY_CONVERT(date, ...) for month filters. "
-            "Also confirm the SQL login can read the DataVista database."
-        )
+        if domain == "datavista":
+            hint = (
+                "This looked like a DataVista (recruiting) question. "
+                "Use SUBMITTALDATE (not SubmitDate), PRIMARYRECRUITERNAME, "
+                "and TRY_CONVERT(date, ...) for month filters. "
+                "Confirm the SQL login can read the DataVista database."
+            )
+        else:
+            hint = (
+                "This looked like a Prohance (attendance/hours) question. "
+                "Use sessionDate for month filters, userName for the person, "
+                "and SUM of DATEDIFF(SECOND, ...) on logged_hours as total_seconds "
+                "(do not convert totals back to TIME — it wraps at 24 hours)."
+            )
         return jsonify(
             {
                 "query": sql_query,
                 "answer": (
                     "I couldn't run the database query. The table or column name may be wrong "
                     "for your connected SQL Server database.\n\n"
-                    f"{hint}"
+                    f"{hint}\n\n"
+                    "Open SQL query details below to see the exact statement that failed."
                 ),
                 "error": detail,
                 "data": [],
                 "chart_type": "table",
+                "domain": domain,
             }
         )
     except Exception as exc:
