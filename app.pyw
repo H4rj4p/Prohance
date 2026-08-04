@@ -767,6 +767,17 @@ def enhance_for_sql(question):
     if detect_question_domain(question) == "datavista":
         notes.append(datavista_table_guidance(question))
 
+    if re.search(r"\bthis\s+month\b", text, re.IGNORECASE):
+        notes.append(
+            'IMPORTANT: "this month" means the current calendar month from today\'s date '
+            "(see date bounds in the system prompt). Do not use a different month/year."
+        )
+    if re.search(r"\bthis\s+year\b", text, re.IGNORECASE):
+        notes.append(
+            'IMPORTANT: "this year" means the current calendar year from today\'s date '
+            "(Jan 1 through Dec 31 of that year). Do not use a different year."
+        )
+
     if not notes:
         return question
 
@@ -836,6 +847,12 @@ def format_for_prompt(
 
     lines.append(f"Current question: {question}" if lines else question)
     lines.append(f"Active database domain: {domain}")
+    if extract_name_hints(question) and not is_comparison_question(question):
+        lines.append(
+            "IMPORTANT: The current question names a person. "
+            "Answer only about that person. Do not reuse a different person "
+            "from earlier conversation turns unless this is an explicit comparison."
+        )
 
     if domain == "datavista":
         # Named people are always the recruiter/user — never candidates.
@@ -2508,7 +2525,11 @@ def resolve_person_from_question(question, primary_table, confirmed_username, co
     domain = detect_question_domain(question)
 
     if confirmed_username or confirmed_employee_id:
-        return confirmed_username, confirmed_employee_id, [], domain, "resolved"
+        if should_reuse_prior_person(question, confirmed_username, confirmed_employee_id):
+            return confirmed_username, confirmed_employee_id, [], domain, "resolved"
+        # Current question names a different person — ignore prior confirmation.
+        confirmed_username = None
+        confirmed_employee_id = None
 
     if not looks_like_person_question(question):
         return None, None, [], domain, "none"
@@ -2782,22 +2803,140 @@ def build_chart_followup_response(question, last_result):
     }
 
 
-def current_date_context():
+def current_date_context(domain="prohance"):
     today = date.today()
     month_start = today.replace(day=1)
+    year_start = date(today.year, 1, 1)
     if today.month == 12:
         next_month = date(today.year + 1, 1, 1)
     else:
         next_month = date(today.year, today.month + 1, 1)
+    next_year = date(today.year + 1, 1, 1)
+
+    if domain == "datavista":
+        date_cols = (
+            "the stage date column with TRY_CONVERT(date, ...): "
+            "SUBMITTALDATE, INTERVIEWDATE, PLACEMENTDATE/STARTDATE, "
+            "or INTERNALREJECTDATE/EXTERNALREJECTDATE"
+        )
+    else:
+        date_cols = "sessionDate"
 
     return (
         f"Today's date is {today.isoformat()} ({today.strftime('%A')}). "
-        f"Current month is {today.strftime('%B %Y')}. "
-        f"\"This month\" means sessionDate >= '{month_start.isoformat()}' "
-        f"AND sessionDate < '{next_month.isoformat()}'. "
-        "Relative dates like today/yesterday/this week/this month MUST use this date, "
-        "not an assumed year."
+        f"Current calendar month is {today.strftime('%B %Y')}. "
+        f"Current calendar year is {today.year}. "
+        f"\"This month\" means date >= '{month_start.isoformat()}' "
+        f"AND date < '{next_month.isoformat()}'. "
+        f"\"This year\" means date >= '{year_start.isoformat()}' "
+        f"AND date < '{next_year.isoformat()}'. "
+        f"Apply those bounds to {date_cols}. "
+        "Relative dates (today, yesterday, this week, this month, this year) "
+        "MUST use today's date above — never invent a different year or month."
     )
+
+
+def is_comparison_question(question):
+    text = question or ""
+    if COMPARISON_PATTERN.search(text):
+        return True
+    return bool(
+        re.search(
+            r"\b(compare|versus|vs\.?|both|side\s*by\s*side|difference\s+between)\b",
+            text,
+            re.IGNORECASE,
+        )
+    )
+
+
+def has_pronoun_person_followup(question):
+    """True when the question refers to a prior person without naming them."""
+    return bool(
+        re.search(
+            r"\b(he|she|they|them|his|her|their|him|"
+            r"this\s+user|that\s+user|same\s+(?:person|user|recruiter|employee)|"
+            r"the\s+same\s+(?:person|user|one))\b",
+            question or "",
+            re.IGNORECASE,
+        )
+    )
+
+
+def names_refer_to_same_person(hints, full_name):
+    if not hints or not full_name:
+        return False
+    name_l = str(full_name).lower()
+    tokens = [t for t in re.split(r"[^a-z0-9]+", name_l) if t]
+    for hint in hints:
+        h = hint.lower()
+        if h == name_l or h in tokens or name_l.startswith(h + " "):
+            continue
+        if h in name_l:
+            continue
+        return False
+    return True
+
+
+def should_reuse_prior_person(question, confirmed_username=None, confirmed_employee_id=None):
+    """
+    Keep a previously confirmed person only for pronoun follow-ups or comparisons.
+    A newly named person replaces the old one.
+    """
+    if not (confirmed_username or confirmed_employee_id):
+        return False
+    if is_comparison_question(question):
+        return True
+    hints = extract_name_hints(question)
+    if hints:
+        if confirmed_username and names_refer_to_same_person(hints, confirmed_username):
+            return True
+        return False
+    return has_pronoun_person_followup(question)
+
+
+def sanitize_history_for_question(question, history):
+    """
+    Avoid carrying the previous person's SQL filters into a new-person question.
+    Keep full history only for comparisons or pronoun follow-ups.
+    """
+    if not history:
+        return []
+    if is_comparison_question(question) or has_pronoun_person_followup(question):
+        return history
+
+    hints = extract_name_hints(question)
+    if not hints:
+        # No new name — keep history for vague follow-ups like "what about this month?"
+        return history
+
+    cleaned = []
+    for item in history:
+        role = str(item.get("role") or "")
+        content = str(item.get("content") or "")
+        if role.lower() == "user":
+            cleaned.append({"role": role, "content": content})
+            continue
+        # Drop prior SQL / row dumps so the model does not reuse old person filters.
+        clipped = content.split("SQL:")[0].strip()
+        clipped = re.split(r"\nColumns:", clipped, maxsplit=1)[0].strip()
+        if clipped:
+            cleaned.append({"role": role, "content": clipped})
+    return cleaned
+
+
+def should_attach_last_result(question, last_result):
+    if not last_result:
+        return False
+    if is_chart_followup(question):
+        return True
+    if is_comparison_question(question):
+        return True
+    if has_pronoun_person_followup(question):
+        return True
+    # New named person → do not inject previous result context.
+    if extract_name_hints(question):
+        return False
+    return True
 
 
 def generate_sql(
@@ -2808,11 +2947,11 @@ def generate_sql(
     confirmed_employee_id,
     domain="prohance",
 ):
-    date_hint = current_date_context()
+    date_hint = current_date_context(domain=domain)
     enhanced_question = enhance_for_sql(question)
     prompt_question = format_for_prompt(
         enhanced_question,
-        history,
+        sanitize_history_for_question(question, history),
         confirmed_username,
         confirmed_employee_id,
         domain=domain,
@@ -2872,6 +3011,9 @@ def generate_sql(
             "It must be a single SELECT or WITH ... SELECT statement. "
             "For 'how many' questions always write SELECT COUNT(...) FROM ..., "
             "never bare COUNT(...) without SELECT. "
+            "Unless the user is comparing people, answer ONLY about the person "
+            "named in the current question — do not reuse a person from earlier turns. "
+            "\"This month\" / \"this year\" must use the exact date bounds provided above. "
             "Do not use DECLARE, BEGIN/END, USE, SET, or markdown. "
             "No explanation, no INSERT/UPDATE/DELETE."
         ),
@@ -3120,7 +3262,16 @@ def ask_question():
     sql_query = ""
     domain = "prohance"
     try:
+        if not should_attach_last_result(question, last_result):
+            last_result = None
         history = add_result_context_to_history(history, last_result)
+
+        if not should_reuse_prior_person(
+            question, confirmed_username, confirmed_employee_id
+        ):
+            confirmed_username = None
+            confirmed_employee_id = None
+
         primary_table = schema_provider.get_primary_table_name()
         domain = detect_question_domain(question)
 

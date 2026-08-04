@@ -1050,6 +1050,22 @@
       input.style.height = `${Math.min(input.scrollHeight, 160)}px`;
     }
 
+    function looksLikeNewPersonQuestion(text) {
+      // If the user names someone (capitalized token or leading name),
+      // do not attach the previous person's result context unless comparing.
+      const q = String(text || "");
+      if (/\b(compare|versus|vs\.?|both|difference between)\b/i.test(q)) return false;
+      if (/\b(he|she|they|them|his|her|their|him|this user|same person)\b/i.test(q)) {
+        return false;
+      }
+      // Leading name: "Disha how many..." / "Akshay Soni, ..."
+      if (/^\s*[A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,2}\s*[,:]?\s+(how|what|who|show|list|give|tell|did|for)\b/i.test(q)) {
+        return true;
+      }
+      if (/\b(for|did|about)\s+[A-Z][a-zA-Z'.-]+/.test(q)) return true;
+      return false;
+    }
+
     async function sendQuestion(text, confirmedUsername, confirmedEmployeeId) {
       const history = chatHistory.slice(-8);
       send.disabled = true;
@@ -1062,7 +1078,14 @@
 
       try {
         const payload = { message: text, history };
-        if (lastResultContext) payload.last_result = lastResultContext;
+        // New named person → drop prior result memory so old filters are not reused.
+        if (lastResultContext && !looksLikeNewPersonQuestion(text)) {
+          payload.last_result = lastResultContext;
+        } else if (looksLikeNewPersonQuestion(text)) {
+          lastResultContext = null;
+        } else if (lastResultContext) {
+          payload.last_result = lastResultContext;
+        }
         if (confirmedUsername) payload.confirmed_username = confirmedUsername;
         if (confirmedEmployeeId) payload.confirmed_employee_id = String(confirmedEmployeeId);
 

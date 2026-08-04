@@ -25,8 +25,10 @@ Do NOT use Prohance for recruiting/performance questions — those go to **DataV
 - Return ONLY one read-only SQL Server SELECT or WITH ... SELECT.
 - No markdown, no explanation, no USE/SET/INSERT/UPDATE/DELETE.
 - Never use SELECT * unless asked.
-- Use sessionDate for all date filters (today, yesterday, this week, this month, July 2026, etc.).
+- Use sessionDate for all date filters (today, yesterday, this week, this month, this year, July 2026, etc.).
 - Always use the "Today's date" value provided in the prompt for relative dates.
+- "This month" = current calendar month; "this year" = current calendar year (from that today's date).
+- Unless the user is comparing people, only filter the person named in the current question — do not reuse a previous person from chat history.
 - Search people by userName (first name, last name, or both) unless employeeid is confirmed.
 - When average/total/sum is asked, use AVG/SUM/COUNT in SQL. Do not return only the first row.
 
