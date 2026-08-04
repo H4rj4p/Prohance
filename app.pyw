@@ -437,6 +437,11 @@ NAME_STOPWORDS = {
     "agreed", "primary", "quickbooks", "flag", "flags", "master", "table",
     "tables", "column", "columns", "row", "rows", "query", "sql", "database",
     "db", "dtae", "dta", "teh", "wat", "wut",
+    "monthly", "weekly", "yearly", "quarterly", "annually", "annual", "daily",
+    "currently", "recently", "previous", "previously", "overall", "totaled",
+    "something", "anything", "nothing", "everything", "metric", "metrics",
+    "amount", "number", "count", "counts", "stats", "statistics", "report",
+    "summary", "breakdown", "trend", "trends", "compare", "comparison",
 }
 
 
@@ -1125,6 +1130,9 @@ def extract_name_hints(question):
             key = cleaned.lower()
             if len(cleaned) < 2 or key in NAME_STOPWORDS or key in seen:
                 continue
+            # Adjectives like monthly/weekly are never names.
+            if key.endswith("ly") and key not in {"lily", "kelly", "holly", "emily", "hailey", "bailey"}:
+                continue
             seen.add(key)
             parts.append(cleaned)
             if len(parts) >= 3:
@@ -1161,8 +1169,12 @@ def extract_name_hints(question):
     for token in tokens:
         cleaned = token.strip(".'-")
         key = cleaned.lower()
-        if len(cleaned) < 2 or key in NAME_STOPWORDS or key in seen:
-            # Stop a name run once question words resume.
+        if (
+            len(cleaned) < 2
+            or key in NAME_STOPWORDS
+            or key in seen
+            or (key.endswith("ly") and key not in {"lily", "kelly", "holly", "emily", "hailey", "bailey"})
+        ):
             if hints:
                 break
             continue
@@ -1172,6 +1184,50 @@ def extract_name_hints(question):
             break
 
     return hints
+
+
+def looks_like_person_question(question):
+    """
+    Only run person lookup when the question actually seems to name someone.
+    Avoid treating words like "monthly" as people.
+    """
+    text = question or ""
+    if not text.strip():
+        return False
+
+    if re.search(
+        r"\b(?:candidate|employee|recruiter|user)(?:'s)?\s+[A-Za-z]",
+        text,
+        re.IGNORECASE,
+    ):
+        return True
+
+    if is_recruiter_question(question):
+        return True
+
+    if re.search(
+        r"\bfor\s+(?:candidate\s+|employee\s+|recruiter\s+|user\s+)?[A-Za-z]",
+        text,
+        re.IGNORECASE,
+    ) and not re.search(
+        r"\bfor\s+(?:this|that|the|each|every|all|last|next|today|yesterday)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        # "for John ..." / "for Akshay logged hours" — but not "for this month"
+        hints = extract_name_hints(question)
+        return bool(hints)
+
+    hints = extract_name_hints(question)
+    if len(hints) >= 2:
+        return True
+
+    if len(hints) == 1:
+        hint = hints[0]
+        # Single token counts only if written like a proper name (capitalized).
+        return bool(re.search(rf"\b{re.escape(hint)}\b", text) and hint[0].isupper())
+
+    return False
 
 
 def levenshtein_distance(left, right):
@@ -1630,6 +1686,12 @@ def resolve_person_from_question(question, primary_table, confirmed_username, co
     """
     domain = detect_question_domain(question)
 
+    if confirmed_username or confirmed_employee_id:
+        return confirmed_username, confirmed_employee_id, [], domain, "resolved"
+
+    if not looks_like_person_question(question):
+        return None, None, [], domain, "none"
+
     if domain == "datavista":
         if is_recruiter_question(question):
             username, person_id, matches, status = resolve_recruiter_from_question(
@@ -1648,8 +1710,7 @@ def resolve_person_from_question(question, primary_table, confirmed_username, co
     if status in {"resolved", "confirm", "ambiguous"}:
         return username, person_id, matches, "prohance", status
 
-    # Name mentioned but not found in Prohance — try DataVista candidates.
-    if extract_name_hints(question) and not (confirmed_username or confirmed_employee_id):
+    if extract_name_hints(question):
         username, person_id, matches, status = resolve_candidate_from_question(
             question, confirmed_username, confirmed_employee_id
         )
@@ -1657,8 +1718,8 @@ def resolve_person_from_question(question, primary_table, confirmed_username, co
             return username, person_id, matches, "datavista", status
 
     return (
-        confirmed_username,
-        confirmed_employee_id,
+        None,
+        None,
         [],
         "prohance",
         "not_found" if extract_name_hints(question) else "none",
