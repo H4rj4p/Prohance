@@ -73,6 +73,16 @@ WHERE NULLIF(LTRIM(RTRIM(COMPANYNAME)), '') IS NOT NULL
    OR NULLIF(LTRIM(RTRIM(AGREEDPAYRATE)), '') IS NOT NULL
 ORDER BY Stage;
 
+-- How many submittals did someone make this month?
+SELECT COUNT(*) AS submittal_count
+FROM DataVista.dbo.CR_SubmittalMaster
+WHERE TRY_CONVERT(date, SUBMITTALDATE) >= DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1)
+  AND (
+    PRIMARYRECRUITERNAME LIKE '%Jordan%'
+    OR (USERFIRSTNAME LIKE '%Jordan%' AND USERLASTNAME LIKE '%Lee%')
+    OR (USERFIRSTNAME + ' ' + USERLASTNAME) LIKE '%Jordan%Lee%'
+  );
+
 -- Submittal pay rate + company (when question says submittal)
 SELECT
   CANDIDATEFIRSTNAME,
@@ -107,3 +117,29 @@ FROM DataVista.dbo.CR_RejectMaster
 WHERE TRY_CONVERT(date, COALESCE(INTERNALREJECTDATE, EXTERNALREJECTDATE)) >= DATEFROMPARTS(YEAR(GETDATE()), 1, 1)
 GROUP BY REJECTREASON
 ORDER BY reject_count DESC;
+
+-- Placement date (offer received) vs start date (first day of work)
+SELECT
+  CANDIDATEFIRSTNAME,
+  CANDIDATELASTNAME,
+  COMPANYNAME,
+  JOBTITLE,
+  PLACEMENTDATE AS offer_or_placement_date,
+  STARTDATE AS work_start_date,
+  PRIMARYRECRUITERNAME
+FROM DataVista.dbo.CR_HireMaster
+WHERE CANDIDATEFIRSTNAME LIKE '%John%'
+  AND CANDIDATELASTNAME LIKE '%Smith%';
+
+-- How many clients/companies a recruiter got this month (performance)
+SELECT
+  COALESCE(PRIMARYRECRUITERNAME, USERFIRSTNAME + ' ' + USERLASTNAME) AS recruiter_name,
+  COUNT(DISTINCT COMPANYNAME) AS client_count,
+  COUNT(DISTINCT CANDIDATEID) AS candidate_count
+FROM DataVista.dbo.CR_HireMaster
+WHERE (
+        PRIMARYRECRUITERNAME LIKE '%Jordan%'
+        OR (USERFIRSTNAME LIKE '%Jordan%' AND USERLASTNAME LIKE '%Lee%')
+      )
+  AND TRY_CONVERT(date, PLACEMENTDATE) >= DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1)
+GROUP BY COALESCE(PRIMARYRECRUITERNAME, USERFIRSTNAME + ' ' + USERLASTNAME);

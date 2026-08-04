@@ -207,7 +207,9 @@ class SchemaProvider:
             "\n-- IMPORTANT: logged_hours and aafs*/break duration columns are often "
             "stored as VARCHAR 'HH:MM:SS' (example '00:53:45'). "
             "Convert to seconds with DATEDIFF(SECOND, 0, TRY_CAST(... AS TIME)) "
-            "before AVG, SUM, or addition. Never COALESCE(column, 0) on those varchar times.\n"
+            "before AVG, SUM, or addition. Never COALESCE(column, 0) on those varchar times. "
+            "For totals/averages return INTEGER seconds (total_seconds / avg_seconds). "
+            "Do not CONVERT aggregates back to TIME — TIME wraps at 24 hours.\n"
         )
 
         live_schema = self._load_schema_from_database()
@@ -286,20 +288,38 @@ DATAVISTA_TABLES = (
 
 DATAVISTA_PATTERN = re.compile(
     r"\b("
-    r"datavista|hire[ds]?|hiring|interview(?:s|ed)?|reject(?:ion|ed|s)?|"
-    r"submittal(?:s)?|submitted|candidate(?:s)?|recruiter(?:s)?|"
-    r"recruit(?:s|ed|ing)?|placement(?:s)?|bill\s*rate|pay\s*rate|job\s*title|"
-    r"company\s*name|agreed\s*pay|cr_hire|cr_interview|cr_reject|cr_submittal|"
-    r"pipeline|recruiting"
+    r"datavista|"
+    r"hire[ds]?|hiring|offer(?:ed|s)?|interview(?:s|ed)?|"
+    r"reject(?:ion|ed|s)?|"
+    # submit / submits / submitted / submittal(s) / submission(s)
+    r"submit(?:s|ted|tal|tals)?|submission(?:s)?|"
+    r"candidate(?:s)?|client(?:s)?|recruiter(?:s)?|recruit(?:s|ed|ing)?|"
+    r"placement(?:s)?|placement\s*date|hire\s*date|offer\s*date|start\s*date|"
+    r"bill\s*rate|pay\s*rate|agreed\s*pay(?:\s*rate)?|agreed\s*bill(?:\s*rate)?|"
+    r"job\s*title|company(?:\s*name)?|pipeline|recruiting|"
+    r"quickbooks|job\s*id|job\s*reference|division|"
+    r"cr_hire|cr_interview|cr_reject|cr_submittal"
     r")\b",
     re.IGNORECASE,
 )
 
+# Prohance = attendance / time only.
+# Include bare "hour(s)" / "log" / "logged" so questions like
+# "how many hour did he log for July" do not fall through to DataVista.
 PROHANCE_PATTERN = re.compile(
     r"\b("
-    r"prohance|logged\s*hours?|aafs|break(?:s)?|login|logout|session\s*date|"
-    r"attendance|shift(?:s)?|late\s*login|swipe|personal\s*time|lunch\s*break|"
-    r"workforce|employee\s*hours"
+    r"prohance|"
+    r"hours?|logged|logging|"
+    r"logged\s*hours?|hours?\s*logged|hours?\s*worked|worked\s*hours?|"
+    r"total\s*hours?|average\s*hours?|avg\s*hours?|"
+    r"(?:did|does|have|has)\s+(?:he|she|they)\s+log|log\s+for|"
+    r"\blog\b|"
+    r"aafs|break(?:s)?|lunch\s*break|short\s*break|personal\s*time|"
+    r"login|logout|first\s*login|last\s*logout|session\s*date|"
+    r"attendance|shift(?:s)?|late\s*login|early\s*logout|swipe|"
+    r"workforce|employee\s*hours|time\s*tracked|time\s*tracking|"
+    r"time\s*at\s*(?:work|desk)|on\s*desk|away\s*from\s*system|"
+    r"how\s+long\s+(?:did|have)\b|were\s+they\s+late|clock\s*in|clock\s*out"
     r")\b",
     re.IGNORECASE,
 )
@@ -311,21 +331,45 @@ def get_datavista_database_name():
 
 
 def detect_question_domain(question):
+    """
+    Route questions to Prohance (attendance/time) or DataVista (recruiting).
+
+    Prohance is ONLY for logged hours, breaks, AAFS, login/logout, attendance.
+    Submits, pay rates, start/placement dates, clients, candidates → DataVista.
+    When unsure, prefer DataVista (not Prohance).
+    """
     text = question or ""
     has_datavista = bool(DATAVISTA_PATTERN.search(text))
     has_prohance = bool(PROHANCE_PATTERN.search(text))
 
+    # Explicit database names always win.
     if re.search(r"\bdatavista\b", text, re.IGNORECASE):
         return "datavista"
     if re.search(r"\bprohance\b", text, re.IGNORECASE):
         return "prohance"
-    if has_datavista and not has_prohance:
-        return "datavista"
-    if has_prohance and not has_datavista:
-        return "prohance"
+
+    # If both match, prefer the stronger signal.
+    # Time/hours/log words beat weak overlap; clear recruiting words win otherwise.
     if has_datavista and has_prohance:
+        # "hours" + "start date" etc.: recruiting date/pay/submit wins.
+        if re.search(
+            r"\b("
+            r"submit|submits|submittal|submission|interview|hire|hired|reject|"
+            r"placement|pay\s*rate|bill\s*rate|agreed\s*pay|candidate|client|"
+            r"recruiter|start\s*date|offer|pipeline"
+            r")\b",
+            text,
+            re.IGNORECASE,
+        ):
+            return "datavista"
+        return "prohance"
+    if has_prohance:
+        return "prohance"
+    if has_datavista:
         return "datavista"
-    return "prohance"
+
+    # Default: DataVista for non-attendance questions.
+    return "datavista"
 
 
 def get_datavista_schema_text():
@@ -398,7 +442,8 @@ NAME_STOPWORDS = {
     "is", "are", "was", "were", "be", "been", "being", "am",
     "what", "whats", "who", "whose", "whom", "which", "when", "where", "why", "how",
     "many", "much", "avg", "average", "mean", "total", "sum", "count", "number",
-    "logged", "hours", "hour", "break", "breaks", "lunch", "personal", "time", "times",
+    "logged", "log", "logs", "logging", "hours", "hour",
+    "break", "breaks", "lunch", "personal", "time", "times",
     "login", "logins", "logout", "late", "early", "shift", "shifts", "location",
     "locations", "session", "sessions", "attendance", "activity", "activities",
     "today", "yesterday", "tomorrow", "this", "that", "these", "those", "last", "next",
@@ -408,8 +453,13 @@ NAME_STOPWORDS = {
     "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec",
     "he", "she", "him", "her", "his", "hers", "they", "them", "their", "i", "me", "my",
     "we", "our", "you", "your", "someone", "somebody", "anyone", "anybody",
-    "does", "do", "did", "have", "has", "had", "get", "got", "give", "show", "list",
-    "tell", "please", "can", "could", "would", "should", "will", "just", "also", "only",
+    "does", "do", "did", "have", "has", "had",
+    "get", "got", "getting", "gets", "give", "gave", "given", "giving",
+    "make", "made", "makes", "making", "take", "took", "taken", "taking",
+    "put", "puts", "putting", "let", "lets", "keeping", "keep", "kept",
+    "show", "list", "tell", "please", "can", "could", "would", "should",
+    "will", "just", "also", "only", "were", "been", "being",
+    "them", "those", "these", "into", "onto",
     "all", "any", "some", "each", "every", "both", "between", "during", "before",
     "after", "since", "until", "per", "vs", "versus", "compare", "compared",
     "employee", "employees", "person", "people", "user", "users", "name", "named",
@@ -450,6 +500,7 @@ def is_multi_part(question):
 
 
 def is_recruiter_question(question):
+    """True when the named person is the recruiter/user, not the candidate."""
     text = question or ""
     return bool(
         re.search(
@@ -459,7 +510,17 @@ def is_recruiter_question(question):
             r"candidates?\s+(?:for|of|under)|"
             r"who\s+(?:all\s+)?(?:they|he|she)\s+recruit|"
             r"(?:for|by)\s+this\s+user|"
-            r"worked\s+on|their\s+candidates"
+            r"worked\s+on|their\s+candidates|"
+            # "how many submits/hires/clients did Jordan make/get"
+            r"how\s+many\s+"
+            r"(?:submits?|submittals?|submissions?|hires?|interviews?|rejects?|"
+            r"clients?|candidates?|placements?|offers?)"
+            r"\b.*\b(?:did|has|have|made|got|get)\b|"
+            # "submits Jordan made" / "submittals by Priya" / "hires for this user"
+            r"(?:submits?|submittals?|submissions?|hires?|interviews?|rejects?|"
+            r"placements?)\s+(?:did|for|by|from)\b|"
+            r"(?:did|made|got)\s+.+\s+"
+            r"(?:submit|submittal|hire|interview|place|recruit)"
             r")\b",
             text,
             re.IGNORECASE,
@@ -470,38 +531,74 @@ def is_recruiter_question(question):
 def datavista_table_guidance(question):
     text = (question or "").lower()
 
-    if is_recruiter_question(question):
+    if is_recruiter_question(question) or re.search(
+        r"\b(how\s+many\s+clients?|clients?\s+did|performance|placed|placements?\s+did)\b",
+        text,
+    ):
         return (
-            "TABLE RULE: This is a recruiter/user question. Treat the named person as the "
+            "DATABASE: DataVista (recruiting/performance). "
+            "This is a recruiter/user performance question. Treat the named person as the "
             "user/recruiter. Filter PRIMARYRECRUITERNAME / USERFIRSTNAME / USERLASTNAME / userid. "
-            "Return candidate names plus light info (job title, company, pay rate, location, date). "
-            "UNION ALL across CR_SubmittalMaster, CR_InterviewMaster, CR_HireMaster, and "
-            "CR_RejectMaster with a Stage column unless one stage is explicitly named."
+            "Return candidate/client results with light info "
+            "(candidate name, company, job title, pay rate, location, stage date). "
+            "If stage is unnamed, UNION ALL all four CR_* tables with a Stage column. "
+            "For client counts use COUNT(DISTINCT COMPANYNAME)."
+        )
+
+    if re.search(r"\b(placement\s*date|offer\s*date|hire\s*date|received\s+an\s+offer)\b", text):
+        return (
+            "DATABASE: DataVista. TABLE: CR_HireMaster only. "
+            "Use PLACEMENTDATE (date they received the offer / were placed). "
+            "Do not confuse with STARTDATE."
+        )
+
+    if re.search(
+        r"\b(start\s*date|started\s+work|first\s+day|came\s+in\s+for\s+work|start\s+work)\b",
+        text,
+    ):
+        return (
+            "DATABASE: DataVista. TABLE: CR_HireMaster only. "
+            "Use STARTDATE (date they started work). "
+            "Do not confuse with PLACEMENTDATE (offer/placement date)."
         )
 
     if re.search(r"\b(interview|interviewed|interviews)\b", text):
-        return "TABLE RULE: Use ONLY DataVista.dbo.CR_InterviewMaster."
+        return (
+            "DATABASE: DataVista. TABLE: CR_InterviewMaster only. "
+            "Use INTERVIEWDATE for interview timing."
+        )
+
     if re.search(r"\b(submittal|submitted|submit|submission)s?\b", text):
-        return "TABLE RULE: Use ONLY DataVista.dbo.CR_SubmittalMaster."
+        return (
+            "DATABASE: DataVista. TABLE: CR_SubmittalMaster only. "
+            "Use SUBMITTALDATE for when they were submitted."
+        )
+
     if re.search(r"\b(reject|rejected|rejection|rejects)\b", text):
-        return "TABLE RULE: Use ONLY DataVista.dbo.CR_RejectMaster."
-    if re.search(r"\b(hire[ds]?|hiring|placement|placements|start\s*date|bill\s*rate)\b", text):
-        return "TABLE RULE: Use ONLY DataVista.dbo.CR_HireMaster."
+        return (
+            "DATABASE: DataVista. TABLE: CR_RejectMaster only. "
+            "Use INTERNALREJECTDATE / EXTERNALREJECTDATE and REJECTREASON."
+        )
+
+    if re.search(r"\b(hire[ds]?|hiring|offer(?:ed|s)?|bill\s*rate)\b", text):
+        return (
+            "DATABASE: DataVista. TABLE: CR_HireMaster only. "
+            "PLACEMENTDATE = offer/placement date; STARTDATE = work start date."
+        )
 
     if re.search(
         r"\b(pay\s*rate|agreed\s*pay|company(?:\s*name)?|job\s*title|location)\b",
         text,
     ):
         return (
-            "TABLE RULE: Stage is ambiguous. Do NOT default to CR_HireMaster. "
-            "UNION ALL matching rows from CR_SubmittalMaster, CR_InterviewMaster, "
-            "CR_HireMaster, and CR_RejectMaster with a Stage column. "
-            "Return rows where the requested fields are present."
+            "DATABASE: DataVista. Stage unclear — do NOT default to CR_HireMaster. "
+            "UNION ALL CR_SubmittalMaster, CR_InterviewMaster, CR_HireMaster, CR_RejectMaster "
+            "with a Stage column. Return rows where requested fields are present."
         )
 
     return (
-        "TABLE RULE: If the pipeline stage is unclear, search ALL four CR_* tables "
-        "with UNION ALL and a Stage column. Do not guess only CR_HireMaster."
+        "DATABASE: DataVista. If pipeline stage is unclear, UNION ALL all four CR_* tables "
+        "with a Stage column. Remember: Prohance is only for attendance/logged hours/breaks."
     )
 
 
@@ -520,8 +617,10 @@ def enhance_for_sql(question):
         notes.append(
             "IMPORTANT: The user asked for an aggregate. Use AVG/SUM in SQL over matching rows. "
             "Do NOT return only the first raw row. "
-            "Duration fields may be VARCHAR 'HH:MM:SS' — convert to seconds before AVG/SUM, "
-            "then convert the result back to HH:MM:SS for display."
+            "Duration fields may be VARCHAR 'HH:MM:SS' — convert to seconds before AVG/SUM. "
+            "Return the aggregate as INTEGER seconds (alias total_seconds or avg_seconds). "
+            "NEVER CONVERT/DATEADD back to TIME/HH:MM:SS for totals — SQL TIME wraps at 24 hours "
+            "and month totals would be wrong. The app formats seconds into days/weeks/hours."
         )
 
     if re.search(
@@ -531,7 +630,9 @@ def enhance_for_sql(question):
     ):
         notes.append(
             "IMPORTANT: Break/AAFS/logged_hours values look like '00:53:45'. "
-            "Never COALESCE(column, 0) or AVG(column) directly on those varchar times."
+            "Never COALESCE(column, 0) or AVG(column) directly on those varchar times. "
+            "For total logged hours / total breaks in a week or month, SUM the seconds and "
+            "return total_seconds only (no TIME convert)."
         )
 
     if detect_question_domain(question) == "datavista":
@@ -546,7 +647,9 @@ def enhance_for_sql(question):
 def enhance_for_answer(question):
     base = (
         "\n\nIMPORTANT: Answer in 1-2 short natural-language sentences only. "
-        "Example style: \"Akshay Soni averaged 32.5 logged hours this month.\" "
+        "Example style: \"Akshay Soni logged 1 week 2 days and 3 hours in July.\" "
+        "When a duration field is present, use that exact human wording "
+        "(days/weeks/hours/minutes), not HH:MM:SS clock time. "
         "Lead with the person, the metric, and the time period."
     )
     if not is_multi_part(question):
@@ -714,22 +817,32 @@ def extract_sql_query(raw):
             for key in ("query", "Query", "sql", "SQL"):
                 value = payload.get(key)
                 if value is not None:
-                    return str(value)
+                    return repair_select_query(str(value))
     except ValueError:
         pass
 
     # Prefer a full CTE (WITH ... SELECT) over the first inner SELECT.
     with_match = re.search(r"(?:^|;)\s*(WITH\b[\s\S]+)", raw, re.IGNORECASE)
     select_match = re.search(r"\bSELECT\b[\s\S]+", raw, re.IGNORECASE)
+    # Models sometimes omit SELECT on "how many" answers: COUNT(*) FROM ...
+    aggregate_match = re.search(
+        r"\b((?:COUNT|AVG|SUM|MIN|MAX)\s*\([\s\S]+)",
+        raw,
+        re.IGNORECASE,
+    )
 
     if with_match and select_match and with_match.start() <= select_match.start():
-        return with_match.group(1).strip().rstrip(";")
+        return repair_select_query(with_match.group(1).strip().rstrip(";"))
     if select_match:
-        return select_match.group(0).strip().rstrip(";")
+        return repair_select_query(select_match.group(0).strip().rstrip(";"))
     if with_match:
-        return with_match.group(1).strip().rstrip(";")
+        return repair_select_query(with_match.group(1).strip().rstrip(";"))
+    if aggregate_match:
+        return repair_select_query(
+            f"SELECT {aggregate_match.group(1).strip().rstrip(';')}"
+        )
 
-    return raw
+    return repair_select_query(raw)
 
 
 def normalize_readonly_sql(sql):
@@ -738,6 +851,7 @@ def normalize_readonly_sql(sql):
         return sql
 
     sql = sql.strip().lstrip(";").strip()
+    sql = sql.lstrip("\ufeff\u200b\u200c\u200d").strip()
     # Drop leading USE / SET lines (e.g. SET NOCOUNT ON) before the real query.
     while True:
         match = re.match(
@@ -748,6 +862,258 @@ def normalize_readonly_sql(sql):
         if not match:
             break
         sql = sql[match.end():].lstrip(";").strip()
+    return sql
+
+
+def _strip_sql_wrapper_noise(sql):
+    """Remove trailing BEGIN/END wrappers and leftover JSON/markdown crumbs."""
+    if not sql:
+        return sql
+    sql = sql.strip().rstrip(";").strip()
+    sql = re.sub(r"^\s*BEGIN\s+", "", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"\s+END\s*$", "", sql, flags=re.IGNORECASE)
+    # Leftover from {"query":"..."} only — never strip a lone trailing quote,
+    # which would break LIKE '%Name%' and cause SQL error 42000.
+    sql = re.sub(r'["\']\}\s*$', "", sql).strip()
+    sql = re.sub(r"\}\s*$", "", sql).strip()
+    return sql.rstrip(";").strip()
+
+
+def repair_select_query(sql):
+    """Fix common model mistakes so valid read-only queries are not blocked."""
+    if not sql or not sql.strip():
+        return sql
+
+    sql = normalize_readonly_sql(strip_comments(sql))
+    sql = _strip_sql_wrapper_noise(sql)
+    if not sql:
+        return sql
+
+    # Already a normal SELECT / CTE / subquery.
+    upper = sql.upper()
+    if upper.startswith("SELECT") or upper.startswith("WITH") or upper.startswith("("):
+        return _strip_sql_wrapper_noise(sql)
+
+    # Inline DECLARE @x = expr first so SELECT does not keep undeclared @vars.
+    if re.search(r"\bDECLARE\b", sql, re.IGNORECASE):
+        sql = expand_declare_variables(sql)
+        sql = _strip_sql_wrapper_noise(sql)
+        upper = sql.upper()
+        if upper.startswith("SELECT") or upper.startswith("WITH") or upper.startswith("("):
+            return sql
+
+    # Drop leading DECLARE @x = ... before a SELECT (keep the SELECT only).
+    declare_select = re.search(
+        r"\bDECLARE\b[\s\S]*?\b(SELECT\b[\s\S]+)",
+        sql,
+        re.IGNORECASE,
+    )
+    if declare_select:
+        return _strip_sql_wrapper_noise(declare_select.group(1))
+
+    # "how many ..." answers sometimes come back as: COUNT(*) FROM table WHERE ...
+    if re.match(r"^(?:COUNT|AVG|SUM|MIN|MAX)\s*\(", sql, re.IGNORECASE):
+        return f"SELECT {_strip_sql_wrapper_noise(sql)}"
+
+    # Or prose before the real query — pull SELECT/WITH/aggregate out.
+    select_match = re.search(r"\bSELECT\b[\s\S]+", sql, re.IGNORECASE)
+    with_match = re.search(r"\bWITH\b[\s\S]+", sql, re.IGNORECASE)
+    aggregate_match = re.search(
+        r"\b((?:COUNT|AVG|SUM|MIN|MAX)\s*\([\s\S]+)",
+        sql,
+        re.IGNORECASE,
+    )
+    if with_match and (not select_match or with_match.start() <= select_match.start()):
+        return _strip_sql_wrapper_noise(with_match.group(0))
+    if select_match:
+        return _strip_sql_wrapper_noise(select_match.group(0))
+    if aggregate_match:
+        return f"SELECT {_strip_sql_wrapper_noise(aggregate_match.group(1))}"
+
+    return sql
+
+
+def _split_sql_comma_args(text):
+    """Split on commas that are outside parentheses and string literals."""
+    parts = []
+    buf = []
+    depth = 0
+    in_quote = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if in_quote:
+            buf.append(ch)
+            if ch == "'" and i + 1 < len(text) and text[i + 1] == "'":
+                buf.append(text[i + 1])
+                i += 2
+                continue
+            if ch == "'":
+                in_quote = False
+            i += 1
+            continue
+        if ch == "'":
+            in_quote = True
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "(":
+            depth += 1
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == ")":
+            depth = max(0, depth - 1)
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "," and depth == 0:
+            piece = "".join(buf).strip()
+            if piece:
+                parts.append(piece)
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    piece = "".join(buf).strip()
+    if piece:
+        parts.append(piece)
+    return parts
+
+
+def expand_declare_variables(sql):
+    """
+    Inline DECLARE @var = expr so we do not leave undeclared @variables
+    after stripping DECLARE (a common 42000 failure).
+    """
+    if not sql or not re.search(r"\bDECLARE\b", sql, re.IGNORECASE):
+        return sql
+
+    assignments = {}
+
+    def collect_declare(match):
+        body = match.group(1).strip().rstrip(";")
+        for part in _split_sql_comma_args(body):
+            assign = re.match(
+                r"(@\w+)\s+(?:AS\s+)?[A-Za-z][A-Za-z0-9_\(\)\s]*?\s*=\s*(.+)$",
+                part,
+                re.IGNORECASE | re.DOTALL,
+            )
+            if assign:
+                assignments[assign.group(1)] = assign.group(2).strip().rstrip(";")
+        return " "
+
+    sql = re.sub(
+        r"\bDECLARE\b\s+((?:(?!\bSELECT\b|\bWITH\b|\bSET\b).)+)",
+        collect_declare,
+        sql,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    for var, expr in assignments.items():
+        sql = re.sub(rf"(?<!\w){re.escape(var)}\b", f"({expr})", sql)
+
+    return sql.strip()
+
+
+def fix_datavista_schema(sql):
+    """Rewrite common wrong table/column names the model invents for DataVista."""
+    if not sql:
+        return sql
+
+    table_aliases = {
+        "cr_submitmaster": "CR_SubmittalMaster",
+        "cr_submittals": "CR_SubmittalMaster",
+        "cr_submissionmaster": "CR_SubmittalMaster",
+        "submittalmaster": "CR_SubmittalMaster",
+        "submittals": "CR_SubmittalMaster",
+        "submissions": "CR_SubmittalMaster",
+        "cr_hire": "CR_HireMaster",
+        "cr_hires": "CR_HireMaster",
+        "hiremaster": "CR_HireMaster",
+        "cr_interview": "CR_InterviewMaster",
+        "interviewmaster": "CR_InterviewMaster",
+        "cr_reject": "CR_RejectMaster",
+        "rejectmaster": "CR_RejectMaster",
+    }
+    for wrong, right in table_aliases.items():
+        sql = re.sub(
+            rf"(?<![\w.\]])\[?{wrong}\]?\b",
+            right,
+            sql,
+            flags=re.IGNORECASE,
+        )
+
+    columns = {
+        "submitdate": "SUBMITTALDATE",
+        "submit_date": "SUBMITTALDATE",
+        "submissiondate": "SUBMITTALDATE",
+        "submission_date": "SUBMITTALDATE",
+        "submittal_date": "SUBMITTALDATE",
+        "submitteddate": "SUBMITTALDATE",
+        "submitted_date": "SUBMITTALDATE",
+        "recruitername": "PRIMARYRECRUITERNAME",
+        "recruiter_name": "PRIMARYRECRUITERNAME",
+        "primaryrecruiter": "PRIMARYRECRUITERNAME",
+        "primary_recruiter": "PRIMARYRECRUITERNAME",
+        "primary_recruiter_name": "PRIMARYRECRUITERNAME",
+        "interview_date": "INTERVIEWDATE",
+        "hiredate": "PLACEMENTDATE",
+        "hire_date": "PLACEMENTDATE",
+        "offerdate": "PLACEMENTDATE",
+        "offer_date": "PLACEMENTDATE",
+        "placement_date": "PLACEMENTDATE",
+        "start_date": "STARTDATE",
+        "payrate": "AGREEDPAYRATE",
+        "pay_rate": "AGREEDPAYRATE",
+        "agreed_pay_rate": "AGREEDPAYRATE",
+        "billrate": "AGREEDBILLRATE",
+        "bill_rate": "AGREEDBILLRATE",
+        "company_name": "COMPANYNAME",
+        "job_title": "JOBTITLE",
+        "reject_reason": "REJECTREASON",
+    }
+    for wrong, right in columns.items():
+        sql = re.sub(rf"\b{wrong}\b", right, sql, flags=re.IGNORECASE)
+
+    # Dates are NVARCHAR — YEAR/MONTH/DAY need TRY_CONVERT first.
+    date_cols = (
+        "SUBMITTALDATE",
+        "INTERVIEWDATE",
+        "PLACEMENTDATE",
+        "STARTDATE",
+        "INTERNALREJECTDATE",
+        "EXTERNALREJECTDATE",
+    )
+    for col in date_cols:
+        sql = re.sub(
+            rf"\b(YEAR|MONTH|DAY)\s*\(\s*\[?{col}\]?\s*\)",
+            rf"\1(TRY_CONVERT(date, {col}))",
+            sql,
+            flags=re.IGNORECASE,
+        )
+        # Bare date comparisons: SUBMITTALDATE >= '2026-07-01'
+        # Skip when already wrapped in TRY_CONVERT(date, ...).
+        sql = re.sub(
+            rf"(?<!TRY_CONVERT\(date, )(?<![\w.])\[?{col}\]?\s*(=|<>|!=|>=|<=|>|<)\s*",
+            lambda m, c=col: f"TRY_CONVERT(date, {c}) {m.group(1)} ",
+            sql,
+            flags=re.IGNORECASE,
+        )
+        sql = re.sub(
+            rf"(?<!TRY_CONVERT\(date, )(?<![\w.])\[?{col}\]?\s+BETWEEN\b",
+            f"TRY_CONVERT(date, {col}) BETWEEN",
+            sql,
+            flags=re.IGNORECASE,
+        )
+
+    sql = re.sub(
+        r"TRY_CONVERT\s*\(\s*date\s*,\s*TRY_CONVERT\s*\(\s*date\s*,\s*([A-Za-z0-9_]+)\s*\)\s*\)",
+        r"TRY_CONVERT(date, \1)",
+        sql,
+        flags=re.IGNORECASE,
+    )
     return sql
 
 
@@ -764,11 +1130,16 @@ def clean_sql(sql, actual_table_name="EmployeeAttendance"):
         .strip()
         .rstrip(";")
     )
+    sql = expand_declare_variables(sql)
+    sql = repair_select_query(sql)
     sql = normalize_readonly_sql(sql)
     sql = fix_username_prefix_match(fix_workforce_schema(sql, actual_table_name))
+    sql = fix_datavista_schema(sql)
     sql = qualify_datavista_sql(sql)
     sql = convert_limit_to_top(sql)
-    return ensure_single_readonly_sql(sql)
+    sql = rewrite_duration_time_converts(sql)
+    sql = ensure_single_readonly_sql(sql)
+    return repair_select_query(sql)
 
 def fix_username_prefix_match(sql):
     sql = re.sub(
@@ -866,6 +1237,102 @@ def convert_limit_to_top(sql):
     )
 
 
+def _extract_balanced_call(sql, start_index):
+    """Given index at the '(' of a function call, return (inner, end_index_exclusive)."""
+    if start_index >= len(sql) or sql[start_index] != "(":
+        return None, start_index
+    depth = 0
+    in_quote = False
+    i = start_index
+    while i < len(sql):
+        ch = sql[i]
+        if in_quote:
+            if ch == "'" and i + 1 < len(sql) and sql[i + 1] == "'":
+                i += 2
+                continue
+            if ch == "'":
+                in_quote = False
+            i += 1
+            continue
+        if ch == "'":
+            in_quote = True
+            i += 1
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return sql[start_index + 1 : i], i + 1
+        i += 1
+    return None, start_index
+
+
+def rewrite_duration_time_converts(sql):
+    """
+    Replace CONVERT(varchar(...), DATEADD(SECOND, <expr>, 0), 108) with <expr>
+    so aggregates are returned as seconds instead of TIME (which wraps at 24h).
+    """
+    if not sql or not re.search(r"\bDATEADD\s*\(\s*SECOND\b", sql, re.IGNORECASE):
+        return sql
+
+    pattern = re.compile(r"\bCONVERT\s*\(", re.IGNORECASE)
+    pieces = []
+    cursor = 0
+    for match in pattern.finditer(sql):
+        convert_open = match.end() - 1  # index of '('
+        convert_args, convert_end = _extract_balanced_call(sql, convert_open)
+        if convert_args is None:
+            continue
+
+        # Expect: varchar(...), DATEADD(SECOND, <expr>, 0), 108
+        dateadd_match = re.search(r"\bDATEADD\s*\(", convert_args, re.IGNORECASE)
+        if not dateadd_match:
+            continue
+        # varchar style first arg and style 108 somewhere
+        if not re.search(r"\bvarchar\b", convert_args, re.IGNORECASE):
+            continue
+        if not re.search(r",\s*108\s*$", convert_args.strip(), re.IGNORECASE):
+            continue
+
+        dateadd_open = match.start() + dateadd_match.end() - 1
+        # dateadd_open is absolute? match.start() is CONVERT start; dateadd_match is in convert_args
+        dateadd_open = (convert_open + 1) + dateadd_match.end() - 1
+        dateadd_args, dateadd_end = _extract_balanced_call(sql, dateadd_open)
+        if dateadd_args is None:
+            continue
+        if not re.match(r"^\s*SECOND\s*,", dateadd_args, re.IGNORECASE):
+            continue
+
+        # SECOND, <expr>, 0
+        inner = re.sub(r"^\s*SECOND\s*,\s*", "", dateadd_args, count=1, flags=re.IGNORECASE)
+        inner = re.sub(r",\s*0\s*$", "", inner, count=1).strip()
+        if not inner:
+            continue
+
+        # Prefer casting rounded expressions to int seconds.
+        replacement = inner
+        alias_hint = ""
+        # Preserve AS alias after the CONVERT(...) if present
+        alias_match = re.match(r"\s+AS\s+([A-Za-z_][\w]*)", sql[convert_end:], re.IGNORECASE)
+        if alias_match:
+            alias_name = alias_match.group(1)
+            convert_end = convert_end + alias_match.end()
+            if not re.search(r"second", alias_name, re.IGNORECASE):
+                alias_hint = f" AS {alias_name}_seconds"
+            else:
+                alias_hint = f" AS {alias_name}"
+        else:
+            alias_hint = " AS total_seconds"
+
+        pieces.append(sql[cursor:match.start()])
+        pieces.append(f"{replacement}{alias_hint}")
+        cursor = convert_end
+
+    pieces.append(sql[cursor:])
+    return "".join(pieces)
+
+
 def strip_comments(sql):
     sql = re.sub(r"--[^\r\n]*", "", sql)
     sql = re.sub(r"/\*.*?\*/", "", sql, flags=re.DOTALL)
@@ -928,7 +1395,8 @@ def ensure_single_readonly_sql(sql):
     if not sql or not sql.strip():
         return sql
 
-    stripped = normalize_readonly_sql(strip_comments(sql.strip().rstrip(";")))
+    stripped = repair_select_query(sql)
+    stripped = normalize_readonly_sql(strip_comments(stripped.strip().rstrip(";")))
     parts = split_sql_statements(stripped)
     if not parts:
         return stripped
@@ -936,7 +1404,7 @@ def ensure_single_readonly_sql(sql):
     merged = []
     index = 0
     while index < len(parts):
-        part = parts[index]
+        part = repair_select_query(parts[index])
         next_part = parts[index + 1] if index + 1 < len(parts) else None
         if (
             part.upper().startswith("WITH")
@@ -950,11 +1418,12 @@ def ensure_single_readonly_sql(sql):
         index += 1
 
     for part in merged:
-        upper = part.lstrip().upper()
+        candidate = repair_select_query(part).strip()
+        upper = candidate.lstrip().upper()
         if upper.startswith("SELECT") or upper.startswith("WITH") or upper.startswith("("):
-            return part.strip()
+            return candidate
 
-    return merged[0].strip()
+    return repair_select_query(merged[0]).strip()
 
 
 def validate_select_query(sql):
@@ -962,6 +1431,7 @@ def validate_select_query(sql):
         return False, "Query is empty."
 
     stripped = ensure_single_readonly_sql(sql)
+    stripped = repair_select_query(stripped)
     if not stripped:
         return False, "Query is empty."
 
@@ -984,10 +1454,11 @@ def validate_select_query(sql):
             return False, f"Blocked keyword detected: {keyword}."
 
     # Allow "SELECT ... FROM ... INTO" only when it is SELECT INTO (write).
+    # Avoid false positives on words like SUBMITTAL containing "into" as letters.
     if re.search(r"\bSELECT\b[\s\S]*?\bINTO\b\s+[\#\[]?\w+", keyword_scan, re.IGNORECASE):
         return False, "SELECT INTO is not allowed."
 
-    upper = stripped.upper()
+    upper = stripped.lstrip().upper()
     if upper.startswith("SELECT") or upper.startswith("("):
         return True, ""
 
@@ -1004,6 +1475,138 @@ def make_json_value(value):
     if isinstance(value, bytes):
         return int.from_bytes(value, byteorder="big") if len(value) <= 8 else value.hex()
     return value
+
+
+def format_duration_seconds(seconds):
+    """
+    Human duration that does not wrap at 24 hours.
+    Examples: "3 hours 15 minutes", "1 day 3 hours", "2 weeks 23 hours and 10 minutes"
+    """
+    try:
+        total = int(round(float(seconds)))
+    except (TypeError, ValueError):
+        return None
+    if total < 0:
+        total = 0
+
+    weeks, rem = divmod(total, 7 * 24 * 3600)
+    days, rem = divmod(rem, 24 * 3600)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+
+    parts = []
+    if weeks:
+        parts.append(f"{weeks} week{'s' if weeks != 1 else ''}")
+    if days:
+        parts.append(f"{days} day{'s' if days != 1 else ''}")
+    if hours:
+        parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
+    if minutes:
+        parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+    if not parts:
+        if secs:
+            parts.append(f"{secs} second{'s' if secs != 1 else ''}")
+        else:
+            return "0 minutes"
+
+    if len(parts) == 1:
+        return parts[0]
+    if len(parts) == 2:
+        return f"{parts[0]} and {parts[1]}"
+    return f"{', '.join(parts[:-1])}, and {parts[-1]}"
+
+
+def parse_hhmmss_to_seconds(value):
+    """Parse 'HH:MM:SS' / 'H:MM:SS' into seconds. Returns None if not a time string."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    match = re.fullmatch(r"(\d{1,4}):([0-5]?\d):([0-5]?\d)", text)
+    if not match:
+        return None
+    hours, minutes, seconds = (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def _is_seconds_column(name):
+    key = re.sub(r"[^a-z0-9]+", "", (name or "").lower())
+    return key.endswith("seconds") or key.endswith("secs") or key in {
+        "totalseconds",
+        "avgseconds",
+        "loggedseconds",
+        "breakseconds",
+        "durationseconds",
+        "sumseconds",
+    }
+
+
+def _is_duration_label_column(name):
+    key = re.sub(r"[^a-z0-9]+", "", (name or "").lower())
+    return any(
+        token in key
+        for token in (
+            "loggedhour",
+            "totalhour",
+            "totalbreak",
+            "avgbreak",
+            "avglogged",
+            "duration",
+            "totaltime",
+            "breaktime",
+        )
+    ) or key in {
+        "loggedhours",
+        "logged_hours",
+        "totalhours",
+        "avghours",
+        "hours",
+    }
+
+
+def enrich_duration_results(results):
+    """
+    Add human-readable duration fields so totals > 24h don't look like clock times.
+    Prefers *_seconds columns; also formats HH:MM:SS duration aggregates.
+    """
+    if not results:
+        return results
+
+    enriched = []
+    for row in results:
+        new_row = dict(row)
+        for key, value in list(row.items()):
+            label_key = None
+            seconds = None
+
+            if _is_seconds_column(key) and value is not None:
+                try:
+                    seconds = float(value)
+                except (TypeError, ValueError):
+                    seconds = None
+                if seconds is not None:
+                    base = re.sub(r"_?seconds?$", "", key, flags=re.IGNORECASE)
+                    label_key = f"{base}_duration" if base and base != key else "duration"
+
+            elif value is not None and _is_duration_label_column(key):
+                seconds = parse_hhmmss_to_seconds(value)
+                if seconds is not None:
+                    # Keep original clock string only when under 24h; always add readable label.
+                    label_key = f"{key}_duration" if not key.lower().endswith("duration") else key
+
+            if seconds is None or label_key is None:
+                continue
+
+            readable = format_duration_seconds(seconds)
+            if not readable:
+                continue
+            new_row[label_key] = readable
+            # For second totals, also expose a friendly primary label when missing.
+            if _is_seconds_column(key) and "duration" not in {
+                str(k).lower() for k in new_row.keys()
+            }:
+                new_row["duration"] = readable
+        enriched.append(new_row)
+    return enriched
 
 
 def execute_sql(sql_query):
@@ -1111,11 +1714,33 @@ def sql_literal(value):
     return str(value).replace("'", "''")
 
 
+# Verbs / question words that end a person-name span.
+_NAME_TAIL_VERBS = (
+    r"make|made|makes|making|get|got|gets|getting|give|gave|given|"
+    r"log|logs|logged|logging|work|works|worked|working|"
+    r"have|has|had|submit|submits|submitted|hire|hired|recruit|recruited|"
+    r"show|list|tell|do|does|did|is|are|was|were|can|could|would|should|"
+    r"spend|spent|take|took|use|used"
+)
+_NAME_MONTHS = (
+    r"january|february|march|april|may|june|july|august|september|october|"
+    r"november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec|"
+    r"today|yesterday|tomorrow|this|last|next|week|month|year"
+)
+_NAME_TOKEN = r"[A-Za-z][A-Za-z'.-]*"
+_NAME_SPAN = rf"({_NAME_TOKEN}(?:\s+{_NAME_TOKEN}){{0,2}})"
+
+
 def extract_name_hints(question):
     """
     Pull likely first/last name tokens from a question.
-    Prefer explicit patterns like "candidate John Smith" so words like
-    "date" / "submit" / "interview" are not treated as names.
+
+    Priority:
+    1) Leading name: "Akshay Soni, how many hours..."
+    2) Role marker: "candidate/employee/recruiter Akshay Soni"
+    3) "did <Name> log/make..." / "how many ... did <Name> log..."
+    4) "for <Name>" / "for candidate <Name>"
+    Never treat verbs like log/made or months like July as names.
     """
     text = question or ""
     text = re.sub(r"\b20\d{2}\b", " ", text)
@@ -1125,13 +1750,14 @@ def extract_name_hints(question):
     def clean_name_parts(raw):
         parts = []
         seen = set()
-        for token in re.findall(r"[A-Za-z][A-Za-z'.-]*", raw or ""):
+        for token in re.findall(_NAME_TOKEN, raw or ""):
             cleaned = token.strip(".'-")
             key = cleaned.lower()
             if len(cleaned) < 2 or key in NAME_STOPWORDS or key in seen:
                 continue
-            # Adjectives like monthly/weekly are never names.
-            if key.endswith("ly") and key not in {"lily", "kelly", "holly", "emily", "hailey", "bailey"}:
+            if key.endswith("ly") and key not in {
+                "lily", "kelly", "holly", "emily", "hailey", "bailey",
+            }:
                 continue
             seen.add(key)
             parts.append(cleaned)
@@ -1139,19 +1765,37 @@ def extract_name_hints(question):
                 break
         return parts
 
-    # Prefer names right after role markers / "for", stopping at question words.
     patterned = [
-        r"\bcandidate(?:'s)?\s+([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,2})",
-        r"\bemployee(?:'s)?\s+([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,2})",
-        r"\brecruiter(?:'s)?\s+([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,2})",
-        r"\buser(?:'s)?\s+([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,2})",
-        r"\bfor\s+(?:candidate\s+|employee\s+|recruiter\s+|user\s+)?"
-        r"([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,2})"
-        r"(?=\s+(?:what|when|who|how|did|does|do|has|have|had|was|is|are|"
-        r"the|his|her|their|a|an|on|in|at|to|of|,|\?|$))",
-        r"\b(?:about|regarding)\s+([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,2})\b",
-        r"\b([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,1})(?:'s)?\s+"
-        r"(?:interview|submittal|submission|hire|pay\s*rate|logged|break|hours)\b",
+        # "Akshay Soni, how many hours..." / "Akshay Soni: show logged hours"
+        rf"^\s*{_NAME_SPAN}\s*[,:\-]\s*"
+        rf"(?:how|what|when|who|where|show|list|give|tell|did|does|can|could|"
+        rf"please|find|get)\b",
+        # "Akshay Soni how many hours did he log"
+        rf"^\s*{_NAME_SPAN}\s+"
+        rf"(?:how|what|when|who|where)\b",
+        # role markers — name is the next word(s)
+        rf"\b(?:candidate|employee|recruiter|user)(?:'s)?\s+{_NAME_SPAN}\b",
+        # "for candidate Akshay Soni" / "for employee John"
+        rf"\bfor\s+(?:candidate|employee|recruiter|user)\s+{_NAME_SPAN}\b",
+        # "how many hours/submits did Akshay Soni log/make"
+        rf"\bhow\s+many\s+{_NAME_TOKEN}\s+did\s+{_NAME_SPAN}\s+"
+        rf"(?:{_NAME_TAIL_VERBS})\b",
+        # "did Akshay Soni log" / "has Priya made"
+        rf"\b(?:did|has|have)\s+{_NAME_SPAN}\s+(?:{_NAME_TAIL_VERBS})\b",
+        # "submits Jordan made" / "hours Akshay logged"
+        rf"\b(?:submits?|submittals?|submissions?|hires?|interviews?|rejects?|"
+        rf"clients?|placements?|offers?|hours?)\s+{_NAME_SPAN}\s+"
+        rf"(?:{_NAME_TAIL_VERBS})\b",
+        # "for Akshay Soni" but not "for July" / "for this month"
+        rf"\bfor\s+(?!{_NAME_MONTHS}\b){_NAME_SPAN}"
+        rf"(?=\s+(?:how|what|when|who|did|does|do|has|have|had|was|is|are|"
+        rf"{_NAME_TAIL_VERBS}|the|his|her|their|a|an|on|in|at|to|of|"
+        rf"this|last|next|,|\?|$))",
+        rf"\b(?:about|regarding)\s+{_NAME_SPAN}\b",
+        # "Akshay's logged hours" / "Jordan's submittal"
+        rf"\b{_NAME_SPAN}(?:'s)?\s+"
+        rf"(?:interview|submittal|submission|hire|pay\s*rate|logged|log|"
+        rf"break|hours|submits?)\b",
     ]
 
     for pattern in patterned:
@@ -1162,8 +1806,8 @@ def extract_name_hints(question):
         if parts:
             return parts
 
-    # Fallback: keep only up to two consecutive non-stopword tokens.
-    tokens = re.findall(r"[A-Za-z][A-Za-z'.-]*", text)
+    # Fallback: first 1–2 consecutive non-stopword tokens (usually the leading name).
+    tokens = re.findall(_NAME_TOKEN, text)
     hints = []
     seen = set()
     for token in tokens:
@@ -1173,7 +1817,10 @@ def extract_name_hints(question):
             len(cleaned) < 2
             or key in NAME_STOPWORDS
             or key in seen
-            or (key.endswith("ly") and key not in {"lily", "kelly", "holly", "emily", "hailey", "bailey"})
+            or (
+                key.endswith("ly")
+                and key not in {"lily", "kelly", "holly", "emily", "hailey", "bailey"}
+            )
         ):
             if hints:
                 break
@@ -1189,11 +1836,22 @@ def extract_name_hints(question):
 def looks_like_person_question(question):
     """
     Only run person lookup when the question actually seems to name someone.
-    Avoid treating words like "monthly" as people.
+    Avoid treating words like "monthly" / "made" / "log" as people.
     """
     text = question or ""
     if not text.strip():
         return False
+
+    hints = extract_name_hints(question)
+    if not hints:
+        return False
+
+    # Any clear name cue — leading name, role marker, or 2-token name.
+    if re.search(
+        r"^\s*[A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,2}\s*[,:\-]",
+        text,
+    ):
+        return True
 
     if re.search(
         r"\b(?:candidate|employee|recruiter|user)(?:'s)?\s+[A-Za-z]",
@@ -1210,22 +1868,26 @@ def looks_like_person_question(question):
         text,
         re.IGNORECASE,
     ) and not re.search(
-        r"\bfor\s+(?:this|that|the|each|every|all|last|next|today|yesterday)\b",
+        rf"\bfor\s+(?:{_NAME_MONTHS})\b",
         text,
         re.IGNORECASE,
     ):
-        # "for John ..." / "for Akshay logged hours" — but not "for this month"
-        hints = extract_name_hints(question)
-        return bool(hints)
+        return True
 
-    hints = extract_name_hints(question)
     if len(hints) >= 2:
         return True
 
     if len(hints) == 1:
         hint = hints[0]
-        # Single token counts only if written like a proper name (capitalized).
-        return bool(re.search(rf"\b{re.escape(hint)}\b", text) and hint[0].isupper())
+        # Single token: accept capitalized names, or lowercase if used with did/for.
+        if re.search(rf"\b{re.escape(hint)}\b", text) and hint[0].isupper():
+            return True
+        if re.search(
+            rf"\b(?:did|for|candidate|employee|recruiter)\s+{re.escape(hint)}\b",
+            text,
+            re.IGNORECASE,
+        ):
+            return True
 
     return False
 
@@ -1495,10 +2157,10 @@ def find_matching_candidates(name_hints, limit=20):
                     "("
                     f"CANDIDATEFIRSTNAME LIKE '%{prefix}%' "
                     f"OR CANDIDATELASTNAME LIKE '%{prefix}%' "
-                    f"OR DIFFERENCE(CANDIDATEFIRSTNAME, '{safe}') >= 3 "
-                    f"OR DIFFERENCE(CANDIDATELASTNAME, '{safe}') >= 3 "
-                    f"OR SOUNDEX(CANDIDATEFIRSTNAME) = SOUNDEX('{safe}') "
-                    f"OR SOUNDEX(CANDIDATELASTNAME) = SOUNDEX('{safe}')"
+                    f"OR DIFFERENCE(CAST(CANDIDATEFIRSTNAME AS NVARCHAR(400)), '{safe}') >= 3 "
+                    f"OR DIFFERENCE(CAST(CANDIDATELASTNAME AS NVARCHAR(400)), '{safe}') >= 3 "
+                    f"OR SOUNDEX(CAST(CANDIDATEFIRSTNAME AS NVARCHAR(400))) = SOUNDEX('{safe}') "
+                    f"OR SOUNDEX(CAST(CANDIDATELASTNAME AS NVARCHAR(400))) = SOUNDEX('{safe}')"
                     ")"
                 )
             fuzzy_selects.append(
@@ -1603,9 +2265,9 @@ def find_matching_recruiters(name_hints, limit=20):
                     f"PRIMARYRECRUITERNAME LIKE '%{prefix}%' "
                     f"OR USERFIRSTNAME LIKE '%{prefix}%' "
                     f"OR USERLASTNAME LIKE '%{prefix}%' "
-                    f"OR DIFFERENCE(PRIMARYRECRUITERNAME, '{safe}') >= 3 "
-                    f"OR DIFFERENCE(USERFIRSTNAME, '{safe}') >= 3 "
-                    f"OR DIFFERENCE(USERLASTNAME, '{safe}') >= 3"
+                    f"OR DIFFERENCE(CAST(PRIMARYRECRUITERNAME AS NVARCHAR(400)), '{safe}') >= 3 "
+                    f"OR DIFFERENCE(CAST(USERFIRSTNAME AS NVARCHAR(400)), '{safe}') >= 3 "
+                    f"OR DIFFERENCE(CAST(USERLASTNAME AS NVARCHAR(400)), '{safe}') >= 3"
                     ")"
                 )
             fuzzy_selects.append(
@@ -1704,24 +2366,19 @@ def resolve_person_from_question(question, primary_table, confirmed_username, co
         )
         return username, person_id, matches, "datavista", status
 
-    username, person_id, matches, status = resolve_employee_from_question(
-        question, primary_table, confirmed_username, confirmed_employee_id
-    )
-    if status in {"resolved", "confirm", "ambiguous"}:
+    # Attendance/time questions: resolve against Prohance employees.
+    if domain == "prohance":
+        username, person_id, matches, status = resolve_employee_from_question(
+            question, primary_table, confirmed_username, confirmed_employee_id
+        )
         return username, person_id, matches, "prohance", status
 
-    if extract_name_hints(question):
-        username, person_id, matches, status = resolve_candidate_from_question(
-            question, confirmed_username, confirmed_employee_id
-        )
-        if status != "none":
-            return username, person_id, matches, "datavista", status
-
+    # DataVista (default for non-attendance): recruiters/candidates already handled above.
     return (
         None,
         None,
         [],
-        "prohance",
+        "datavista",
         "not_found" if extract_name_hints(question) else "none",
     )
 
@@ -1730,7 +2387,7 @@ def should_confirm(candidates, question, confirmed_employee_id, confirmed_userna
     # Prefer the pre-query resolver. Avoid large Did-you-mean lists after SQL runs.
     if confirmed_employee_id or confirmed_username:
         return False
-    if not extract_name_hints(question):
+    if not looks_like_person_question(question):
         return False
     if COMPARISON_PATTERN.search(question or ""):
         return False
@@ -2016,10 +2673,16 @@ def generate_sql(
         samples_text = load_text_file("sample_queries_datavista.txt")
         table_rule = datavista_table_guidance(question)
         extra = (
-            f"\nUse three-part names with database [{db_name}], e.g. "
+            f"\nDATABASE ROUTING: DataVista = recruiting/performance "
+            f"(submittals/interviews/hires/rejects/clients). "
+            f"Prohance = attendance (logged hours/breaks/AAFS/login).\n"
+            f"Use three-part names with database [{db_name}], e.g. "
             f"[{db_name}].[dbo].[CR_HireMaster].\n"
             f"{table_rule}\n"
-            "Never default to CR_HireMaster when the question did not say hire/hired/placement."
+            "In CR_HireMaster: PLACEMENTDATE = offer/placement date; "
+            "STARTDATE = date they started work. Never swap them.\n"
+            "Never default to CR_HireMaster when the question did not say "
+            "hire/offer/placement/start date."
         )
     else:
         instructions_text = load_text_file("instructions.txt")
@@ -2032,10 +2695,17 @@ def generate_sql(
         )
         extra = (
             f"{table_hint}\n"
+            "DATABASE ROUTING: Prohance = attendance/time tracking "
+            "(logged hours, breaks, AAFS, login/logout, late login, swipe, shift). "
+            "DataVista = recruiting/performance "
+            "(submittals, interviews, hires, rejects, clients, placement/start dates).\n"
             "Duration columns like logged_hours and aafs* breaks are often VARCHAR 'HH:MM:SS'. "
             "Never COALESCE them with 0 or AVG them directly. Convert to seconds with "
             "DATEDIFF(SECOND, 0, TRY_CAST(... AS TIME)) before AVG/SUM/addition. "
-            "If the user asks for an average, the SQL MUST include AVG(...) and GROUP BY when needed."
+            "For SUM/total of durations (month/week totals), return total_seconds as an integer. "
+            "Do NOT CONVERT seconds back to TIME/varchar HH:MM:SS — TIME wraps at 24 hours. "
+            "If the user asks for an average, the SQL MUST include AVG(...) and GROUP BY when needed, "
+            "and should return avg_seconds (integer), not a TIME string."
         )
 
     raw = get_openai_completion(
@@ -2045,7 +2715,10 @@ def generate_sql(
             f"{date_hint}\n{extra}\n\n"
             "Return ONLY one read-only SQL Server query. "
             "It must be a single SELECT or WITH ... SELECT statement. "
-            "No markdown, no explanation, no USE/SET/INSERT/UPDATE/DELETE."
+            "For 'how many' questions always write SELECT COUNT(...) FROM ..., "
+            "never bare COUNT(...) without SELECT. "
+            "Do not use DECLARE, BEGIN/END, USE, SET, or markdown. "
+            "No explanation, no INSERT/UPDATE/DELETE."
         ),
         user_prompt=prompt_question,
     )
@@ -2088,7 +2761,10 @@ def generate_answer(
     answer_examples = (
         "\"Akshay Soni was hired at Acme for Software Engineer on 2026-07-12.\""
         if domain == "datavista"
-        else "\"Akshay Soni averaged 32.5 logged hours this month.\""
+        else (
+            "\"Akshay Soni logged 1 week 2 days and 3 hours in July.\" "
+            "or \"Akshay Soni averaged 8 hours and 12 minutes per day this month.\""
+        )
     )
 
     try:
@@ -2098,6 +2774,10 @@ def generate_answer(
                 "Reply with ONLY 1-2 short natural-language sentences. "
                 f"Lead with the direct answer in plain English, like: {answer_examples} "
                 "Include the person's full name when available, the key number/date, and the period asked about. "
+                "When a *_duration or duration field is present (for example "
+                "'1 week 2 days and 3 hours'), USE THAT exact wording for time totals — "
+                "do not convert seconds yourself and do not quote HH:MM:SS clock times for "
+                "totals that can exceed 24 hours. "
                 "Do not use markdown, bullets, headings, or tables. "
                 "Do not list rows or repeat every column — the UI already shows the data table underneath. "
                 "If the data is empty, say no matching records were found. "
@@ -2281,6 +2961,8 @@ def ask_question():
             }
         )
 
+    sql_query = ""
+    domain = "prohance"
     try:
         history = add_result_context_to_history(history, last_result)
         primary_table = schema_provider.get_primary_table_name()
@@ -2399,7 +3081,7 @@ def ask_question():
                 }
             )
 
-        results = execute_sql(sql_query)
+        results = enrich_duration_results(execute_sql(sql_query))
         candidates = get_candidates(results)
         if should_confirm(candidates, question, confirmed_employee_id, confirmed_username):
             hint_text = " ".join(extract_name_hints(question)) or "that name"
@@ -2435,16 +3117,38 @@ def ask_question():
                 "data": results,
                 "chart_type": chart_type,
                 "total_rows": len(results),
+                "domain": domain,
             }
         )
     except DATABASE_ERROR_TYPES as exc:
+        detail = str(exc)
+        if domain == "datavista":
+            hint = (
+                "This looked like a DataVista (recruiting) question. "
+                "Use SUBMITTALDATE (not SubmitDate), PRIMARYRECRUITERNAME, "
+                "and TRY_CONVERT(date, ...) for month filters. "
+                "Confirm the SQL login can read the DataVista database."
+            )
+        else:
+            hint = (
+                "This looked like a Prohance (attendance/hours) question. "
+                "Use sessionDate for month filters, userName for the person, "
+                "and SUM of DATEDIFF(SECOND, ...) on logged_hours as total_seconds "
+                "(do not convert totals back to TIME — it wraps at 24 hours)."
+            )
         return jsonify(
             {
+                "query": sql_query,
                 "answer": (
                     "I couldn't run the database query. The table or column name may be wrong "
-                    "for your connected SQL Server database."
+                    "for your connected SQL Server database.\n\n"
+                    f"{hint}\n\n"
+                    "Open SQL query details below to see the exact statement that failed."
                 ),
-                "error": str(exc),
+                "error": detail,
+                "data": [],
+                "chart_type": "table",
+                "domain": domain,
             }
         )
     except Exception as exc:
