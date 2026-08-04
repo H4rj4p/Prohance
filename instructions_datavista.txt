@@ -176,7 +176,9 @@ Use COUNT / COUNT(DISTINCT ...) / AVG / SUM when the question asks how many / av
 
 ## SQL / response rules
 - Return ONLY one read-only SELECT or WITH ... SELECT.
-- No markdown, no explanation, no USE/SET/INSERT/UPDATE/DELETE.
+- "How many" questions MUST be `SELECT COUNT(*) ...` or `SELECT COUNT(DISTINCT ...) ...` — never omit the SELECT keyword.
+- No markdown, no explanation, no DECLARE/USE/SET/INSERT/UPDATE/DELETE.
+- Prefer DATEFROMPARTS / TRY_CONVERT inline for "this month" filters (do not use DECLARE variables).
 - After results: 1-2 short natural sentences first, e.g.
   "Jordan Lee submitted 14 candidates this month across 9 companies."
   "John Smith's placement date was 2026-07-12 and his start date is 2026-08-04."

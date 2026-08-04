@@ -753,22 +753,32 @@ def extract_sql_query(raw):
             for key in ("query", "Query", "sql", "SQL"):
                 value = payload.get(key)
                 if value is not None:
-                    return str(value)
+                    return repair_select_query(str(value))
     except ValueError:
         pass
 
     # Prefer a full CTE (WITH ... SELECT) over the first inner SELECT.
     with_match = re.search(r"(?:^|;)\s*(WITH\b[\s\S]+)", raw, re.IGNORECASE)
     select_match = re.search(r"\bSELECT\b[\s\S]+", raw, re.IGNORECASE)
+    # Models sometimes omit SELECT on "how many" answers: COUNT(*) FROM ...
+    aggregate_match = re.search(
+        r"\b((?:COUNT|AVG|SUM|MIN|MAX)\s*\([\s\S]+)",
+        raw,
+        re.IGNORECASE,
+    )
 
     if with_match and select_match and with_match.start() <= select_match.start():
-        return with_match.group(1).strip().rstrip(";")
+        return repair_select_query(with_match.group(1).strip().rstrip(";"))
     if select_match:
-        return select_match.group(0).strip().rstrip(";")
+        return repair_select_query(select_match.group(0).strip().rstrip(";"))
     if with_match:
-        return with_match.group(1).strip().rstrip(";")
+        return repair_select_query(with_match.group(1).strip().rstrip(";"))
+    if aggregate_match:
+        return repair_select_query(
+            f"SELECT {aggregate_match.group(1).strip().rstrip(';')}"
+        )
 
-    return raw
+    return repair_select_query(raw)
 
 
 def normalize_readonly_sql(sql):
@@ -777,6 +787,7 @@ def normalize_readonly_sql(sql):
         return sql
 
     sql = sql.strip().lstrip(";").strip()
+    sql = sql.lstrip("\ufeff\u200b\u200c\u200d").strip()
     # Drop leading USE / SET lines (e.g. SET NOCOUNT ON) before the real query.
     while True:
         match = re.match(
@@ -787,6 +798,66 @@ def normalize_readonly_sql(sql):
         if not match:
             break
         sql = sql[match.end():].lstrip(";").strip()
+    return sql
+
+
+def _strip_sql_wrapper_noise(sql):
+    """Remove trailing BEGIN/END wrappers and leftover JSON/markdown crumbs."""
+    if not sql:
+        return sql
+    sql = sql.strip().rstrip(";").strip()
+    sql = re.sub(r"^\s*BEGIN\s+", "", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"\s+END\s*$", "", sql, flags=re.IGNORECASE)
+    # Leftover from {"query":"..."} when extraction fell through to regex.
+    # Only strip quote/brace crumbs — never bare ], which is valid in [table].
+    sql = re.sub(r'["\']+\s*[}\]]*\s*$', "", sql).strip()
+    sql = re.sub(r"\}\s*$", "", sql).strip()
+    return sql.rstrip(";").strip()
+
+
+def repair_select_query(sql):
+    """Fix common model mistakes so valid read-only queries are not blocked."""
+    if not sql or not sql.strip():
+        return sql
+
+    sql = normalize_readonly_sql(strip_comments(sql))
+    sql = _strip_sql_wrapper_noise(sql)
+    if not sql:
+        return sql
+
+    # Already a normal SELECT / CTE / subquery.
+    upper = sql.upper()
+    if upper.startswith("SELECT") or upper.startswith("WITH") or upper.startswith("("):
+        return _strip_sql_wrapper_noise(sql)
+
+    # Drop leading DECLARE @x = ... before a SELECT (keep the SELECT only).
+    declare_select = re.search(
+        r"\bDECLARE\b[\s\S]*?\b(SELECT\b[\s\S]+)",
+        sql,
+        re.IGNORECASE,
+    )
+    if declare_select:
+        return _strip_sql_wrapper_noise(declare_select.group(1))
+
+    # "how many ..." answers sometimes come back as: COUNT(*) FROM table WHERE ...
+    if re.match(r"^(?:COUNT|AVG|SUM|MIN|MAX)\s*\(", sql, re.IGNORECASE):
+        return f"SELECT {_strip_sql_wrapper_noise(sql)}"
+
+    # Or prose before the real query — pull SELECT/WITH/aggregate out.
+    select_match = re.search(r"\bSELECT\b[\s\S]+", sql, re.IGNORECASE)
+    with_match = re.search(r"\bWITH\b[\s\S]+", sql, re.IGNORECASE)
+    aggregate_match = re.search(
+        r"\b((?:COUNT|AVG|SUM|MIN|MAX)\s*\([\s\S]+)",
+        sql,
+        re.IGNORECASE,
+    )
+    if with_match and (not select_match or with_match.start() <= select_match.start()):
+        return _strip_sql_wrapper_noise(with_match.group(0))
+    if select_match:
+        return _strip_sql_wrapper_noise(select_match.group(0))
+    if aggregate_match:
+        return f"SELECT {_strip_sql_wrapper_noise(aggregate_match.group(1))}"
+
     return sql
 
 
@@ -803,11 +874,13 @@ def clean_sql(sql, actual_table_name="EmployeeAttendance"):
         .strip()
         .rstrip(";")
     )
+    sql = repair_select_query(sql)
     sql = normalize_readonly_sql(sql)
     sql = fix_username_prefix_match(fix_workforce_schema(sql, actual_table_name))
     sql = qualify_datavista_sql(sql)
     sql = convert_limit_to_top(sql)
-    return ensure_single_readonly_sql(sql)
+    sql = ensure_single_readonly_sql(sql)
+    return repair_select_query(sql)
 
 def fix_username_prefix_match(sql):
     sql = re.sub(
@@ -967,7 +1040,8 @@ def ensure_single_readonly_sql(sql):
     if not sql or not sql.strip():
         return sql
 
-    stripped = normalize_readonly_sql(strip_comments(sql.strip().rstrip(";")))
+    stripped = repair_select_query(sql)
+    stripped = normalize_readonly_sql(strip_comments(stripped.strip().rstrip(";")))
     parts = split_sql_statements(stripped)
     if not parts:
         return stripped
@@ -975,7 +1049,7 @@ def ensure_single_readonly_sql(sql):
     merged = []
     index = 0
     while index < len(parts):
-        part = parts[index]
+        part = repair_select_query(parts[index])
         next_part = parts[index + 1] if index + 1 < len(parts) else None
         if (
             part.upper().startswith("WITH")
@@ -989,11 +1063,12 @@ def ensure_single_readonly_sql(sql):
         index += 1
 
     for part in merged:
-        upper = part.lstrip().upper()
+        candidate = repair_select_query(part).strip()
+        upper = candidate.lstrip().upper()
         if upper.startswith("SELECT") or upper.startswith("WITH") or upper.startswith("("):
-            return part.strip()
+            return candidate
 
-    return merged[0].strip()
+    return repair_select_query(merged[0]).strip()
 
 
 def validate_select_query(sql):
@@ -1001,6 +1076,7 @@ def validate_select_query(sql):
         return False, "Query is empty."
 
     stripped = ensure_single_readonly_sql(sql)
+    stripped = repair_select_query(stripped)
     if not stripped:
         return False, "Query is empty."
 
@@ -1023,10 +1099,11 @@ def validate_select_query(sql):
             return False, f"Blocked keyword detected: {keyword}."
 
     # Allow "SELECT ... FROM ... INTO" only when it is SELECT INTO (write).
+    # Avoid false positives on words like SUBMITTAL containing "into" as letters.
     if re.search(r"\bSELECT\b[\s\S]*?\bINTO\b\s+[\#\[]?\w+", keyword_scan, re.IGNORECASE):
         return False, "SELECT INTO is not allowed."
 
-    upper = stripped.upper()
+    upper = stripped.lstrip().upper()
     if upper.startswith("SELECT") or upper.startswith("("):
         return True, ""
 
@@ -2094,7 +2171,10 @@ def generate_sql(
             f"{date_hint}\n{extra}\n\n"
             "Return ONLY one read-only SQL Server query. "
             "It must be a single SELECT or WITH ... SELECT statement. "
-            "No markdown, no explanation, no USE/SET/INSERT/UPDATE/DELETE."
+            "For 'how many' questions always write SELECT COUNT(...) FROM ..., "
+            "never bare COUNT(...) without SELECT. "
+            "Do not use DECLARE, BEGIN/END, USE, SET, or markdown. "
+            "No explanation, no INSERT/UPDATE/DELETE."
         ),
         user_prompt=prompt_question,
     )

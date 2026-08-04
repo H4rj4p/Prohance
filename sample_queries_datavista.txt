@@ -73,6 +73,16 @@ WHERE NULLIF(LTRIM(RTRIM(COMPANYNAME)), '') IS NOT NULL
    OR NULLIF(LTRIM(RTRIM(AGREEDPAYRATE)), '') IS NOT NULL
 ORDER BY Stage;
 
+-- How many submittals did someone make this month?
+SELECT COUNT(*) AS submittal_count
+FROM DataVista.dbo.CR_SubmittalMaster
+WHERE TRY_CONVERT(date, SUBMITTALDATE) >= DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1)
+  AND (
+    PRIMARYRECRUITERNAME LIKE '%Jordan%'
+    OR (USERFIRSTNAME LIKE '%Jordan%' AND USERLASTNAME LIKE '%Lee%')
+    OR (USERFIRSTNAME + ' ' + USERLASTNAME) LIKE '%Jordan%Lee%'
+  );
+
 -- Submittal pay rate + company (when question says submittal)
 SELECT
   CANDIDATEFIRSTNAME,
