@@ -432,8 +432,13 @@ NAME_STOPWORDS = {
     "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec",
     "he", "she", "him", "her", "his", "hers", "they", "them", "their", "i", "me", "my",
     "we", "our", "you", "your", "someone", "somebody", "anyone", "anybody",
-    "does", "do", "did", "have", "has", "had", "get", "got", "give", "show", "list",
-    "tell", "please", "can", "could", "would", "should", "will", "just", "also", "only",
+    "does", "do", "did", "have", "has", "had",
+    "get", "got", "getting", "gets", "give", "gave", "given", "giving",
+    "make", "made", "makes", "making", "take", "took", "taken", "taking",
+    "put", "puts", "putting", "let", "lets", "keeping", "keep", "kept",
+    "show", "list", "tell", "please", "can", "could", "would", "should",
+    "will", "just", "also", "only", "were", "been", "being",
+    "them", "those", "these", "into", "onto",
     "all", "any", "some", "each", "every", "both", "between", "during", "before",
     "after", "since", "until", "per", "vs", "versus", "compare", "compared",
     "employee", "employees", "person", "people", "user", "users", "name", "named",
@@ -1456,8 +1461,8 @@ def sql_literal(value):
 def extract_name_hints(question):
     """
     Pull likely first/last name tokens from a question.
-    Prefer explicit patterns like "candidate John Smith" so words like
-    "date" / "submit" / "interview" are not treated as names.
+    Prefer explicit patterns like "candidate John Smith" / "did Jordan make"
+    so verbs like "made" and words like "date" are never treated as names.
     """
     text = question or ""
     text = re.sub(r"\b20\d{2}\b", " ", text)
@@ -1481,8 +1486,21 @@ def extract_name_hints(question):
                 break
         return parts
 
-    # Prefer names right after role markers / "for", stopping at question words.
+    # Prefer names right after role markers / "did NAME make" / "for", etc.
     patterned = [
+        # "how many submits did Jordan Lee make/get this month"
+        r"\bhow\s+many\s+[A-Za-z]+\s+did\s+"
+        r"([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,2})"
+        r"(?=\s+(?:make|made|get|got|have|had|in|this|last|for|during|on)\b)",
+        # "did Jordan make" / "has Priya got" / "have they submitted" (name form)
+        r"\b(?:did|has|have)\s+"
+        r"([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,2})\s+"
+        r"(?:make|made|get|got|have|had|submit|submitted|hire|hired|recruit|recruited)\b",
+        # "submits Jordan made" / "hires Priya got"
+        r"\b(?:submits?|submittals?|submissions?|hires?|interviews?|rejects?|"
+        r"clients?|placements?|offers?)\s+"
+        r"([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,2})\s+"
+        r"(?:make|made|get|got|had|have)\b",
         r"\bcandidate(?:'s)?\s+([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,2})",
         r"\bemployee(?:'s)?\s+([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,2})",
         r"\brecruiter(?:'s)?\s+([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,2})",
@@ -1490,7 +1508,8 @@ def extract_name_hints(question):
         r"\bfor\s+(?:candidate\s+|employee\s+|recruiter\s+|user\s+)?"
         r"([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,2})"
         r"(?=\s+(?:what|when|who|how|did|does|do|has|have|had|was|is|are|"
-        r"the|his|her|their|a|an|on|in|at|to|of|,|\?|$))",
+        r"make|made|get|got|the|his|her|their|a|an|on|in|at|to|of|"
+        r"this|last|next|,|\?|$))",
         r"\b(?:about|regarding)\s+([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,2})\b",
         r"\b([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,1})(?:'s)?\s+"
         r"(?:interview|submittal|submission|hire|pay\s*rate|logged|break|hours)\b",
@@ -1531,10 +1550,14 @@ def extract_name_hints(question):
 def looks_like_person_question(question):
     """
     Only run person lookup when the question actually seems to name someone.
-    Avoid treating words like "monthly" as people.
+    Avoid treating words like "monthly" / "made" as people.
     """
     text = question or ""
     if not text.strip():
+        return False
+
+    hints = extract_name_hints(question)
+    if not hints:
         return False
 
     if re.search(
@@ -1544,6 +1567,7 @@ def looks_like_person_question(question):
     ):
         return True
 
+    # Recruiter/performance questions still need a real extracted name.
     if is_recruiter_question(question):
         return True
 
@@ -1556,11 +1580,8 @@ def looks_like_person_question(question):
         text,
         re.IGNORECASE,
     ):
-        # "for John ..." / "for Akshay logged hours" — but not "for this month"
-        hints = extract_name_hints(question)
-        return bool(hints)
+        return True
 
-    hints = extract_name_hints(question)
     if len(hints) >= 2:
         return True
 
