@@ -419,11 +419,24 @@ NAME_STOPWORDS = {
     "first", "second", "third", "one", "two", "three", "four", "five",
     "hire", "hired", "hiring", "hires", "interview", "interviews", "interviewed",
     "reject", "rejected", "rejection", "rejects", "submittal", "submittals",
-    "submitted", "submit", "candidate", "candidates", "recruiter", "recruiters",
+    "submitted", "submit", "submits", "submitting", "submission", "submissions",
+    "candidate", "candidates", "recruiter", "recruiters",
     "company", "companies", "placement", "placements", "bill", "pay", "rate",
     "rates", "job", "jobs", "title", "division", "reason", "reasons",
     "internal", "external", "datavista", "prohance", "pipeline", "recruiting",
     "recruit", "recruited", "recruits", "worked", "work", "everyone", "slight",
+    "date", "dates", "dated", "detail", "details", "field", "fields", "value",
+    "values", "status", "email", "phone", "address", "when", "whenever",
+    "whatever", "wherever", "which", "while", "find", "look", "looking",
+    "search", "searched", "check", "checking", "want", "wanted", "need",
+    "needed", "know", "known", "see", "saw", "ask", "asking", "told", "say",
+    "said", "from", "into", "onto", "upon", "via", "using", "based", "according",
+    "there", "here", "been", "being", "still", "already", "also", "even",
+    "really", "very", "much", "more", "less", "same", "other", "another",
+    "something", "anything", "nothing", "everything", "full", "exact",
+    "agreed", "primary", "quickbooks", "flag", "flags", "master", "table",
+    "tables", "column", "columns", "row", "rows", "query", "sql", "database",
+    "db", "dtae", "dta", "teh", "wat", "wut",
 }
 
 
@@ -461,10 +474,10 @@ def datavista_table_guidance(question):
             "CR_RejectMaster with a Stage column unless one stage is explicitly named."
         )
 
-    if re.search(r"\b(submittal|submitted|submit|submission)s?\b", text):
-        return "TABLE RULE: Use ONLY DataVista.dbo.CR_SubmittalMaster."
     if re.search(r"\b(interview|interviewed|interviews)\b", text):
         return "TABLE RULE: Use ONLY DataVista.dbo.CR_InterviewMaster."
+    if re.search(r"\b(submittal|submitted|submit|submission)s?\b", text):
+        return "TABLE RULE: Use ONLY DataVista.dbo.CR_SubmittalMaster."
     if re.search(r"\b(reject|rejected|rejection|rejects)\b", text):
         return "TABLE RULE: Use ONLY DataVista.dbo.CR_RejectMaster."
     if re.search(r"\b(hire[ds]?|hiring|placement|placements|start\s*date|bill\s*rate)\b", text):
@@ -1094,12 +1107,54 @@ def sql_literal(value):
 
 
 def extract_name_hints(question):
-    """Pull likely first/last name tokens from a question."""
+    """
+    Pull likely first/last name tokens from a question.
+    Prefer explicit patterns like "candidate John Smith" so words like
+    "date" / "submit" / "interview" are not treated as names.
+    """
     text = question or ""
     text = re.sub(r"\b20\d{2}\b", " ", text)
     text = re.sub(r"\b\d{1,2}[/-]\d{1,2}([/-]\d{2,4})?\b", " ", text)
     text = re.sub(r"[`\"“”]", " ", text)
 
+    def clean_name_parts(raw):
+        parts = []
+        seen = set()
+        for token in re.findall(r"[A-Za-z][A-Za-z'.-]*", raw or ""):
+            cleaned = token.strip(".'-")
+            key = cleaned.lower()
+            if len(cleaned) < 2 or key in NAME_STOPWORDS or key in seen:
+                continue
+            seen.add(key)
+            parts.append(cleaned)
+            if len(parts) >= 3:
+                break
+        return parts
+
+    # Prefer names right after role markers / "for", stopping at question words.
+    patterned = [
+        r"\bcandidate(?:'s)?\s+([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,2})",
+        r"\bemployee(?:'s)?\s+([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,2})",
+        r"\brecruiter(?:'s)?\s+([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,2})",
+        r"\buser(?:'s)?\s+([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,2})",
+        r"\bfor\s+(?:candidate\s+|employee\s+|recruiter\s+|user\s+)?"
+        r"([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,2})"
+        r"(?=\s+(?:what|when|who|how|did|does|do|has|have|had|was|is|are|"
+        r"the|his|her|their|a|an|on|in|at|to|of|,|\?|$))",
+        r"\b(?:about|regarding)\s+([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,2})\b",
+        r"\b([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,1})(?:'s)?\s+"
+        r"(?:interview|submittal|submission|hire|pay\s*rate|logged|break|hours)\b",
+    ]
+
+    for pattern in patterned:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if not match:
+            continue
+        parts = clean_name_parts(match.group(1))
+        if parts:
+            return parts
+
+    # Fallback: keep only up to two consecutive non-stopword tokens.
     tokens = re.findall(r"[A-Za-z][A-Za-z'.-]*", text)
     hints = []
     seen = set()
@@ -1107,11 +1162,15 @@ def extract_name_hints(question):
         cleaned = token.strip(".'-")
         key = cleaned.lower()
         if len(cleaned) < 2 or key in NAME_STOPWORDS or key in seen:
+            # Stop a name run once question words resume.
+            if hints:
+                break
             continue
         seen.add(key)
         hints.append(cleaned)
-        if len(hints) >= 4:
+        if len(hints) >= 2:
             break
+
     return hints
 
 
