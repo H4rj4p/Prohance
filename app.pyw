@@ -440,7 +440,9 @@ NAME_STOPWORDS = {
     "a", "an", "the", "and", "or", "for", "of", "on", "in", "at", "to", "from", "by",
     "with", "as", "if", "so", "than", "then", "into", "over", "under", "about",
     "is", "are", "was", "were", "be", "been", "being", "am",
-    "what", "whats", "who", "whose", "whom", "which", "when", "where", "why", "how",
+    "what", "whats", "what's", "whatis", "who", "whos", "who's", "whose", "whom",
+    "which", "when", "where", "wheres", "where's", "why", "how", "hows", "how's",
+    "thats", "that's", "theres", "there's", "heres", "here's",
     "many", "much", "avg", "average", "mean", "total", "sum", "count", "number",
     "logged", "log", "logs", "logging", "hours", "hour",
     "break", "breaks", "lunch", "personal", "time", "times",
@@ -500,106 +502,233 @@ def is_multi_part(question):
 
 
 def is_recruiter_question(question):
-    """True when the named person is the recruiter/user, not the candidate."""
+    """
+    Named people in DataVista are always the user/recruiter (never the candidate).
+    Kept as a helper so prompt/UI wording stays consistent.
+    """
+    return True
+
+
+def is_count_question(question):
     text = question or ""
     return bool(
         re.search(
-            r"\b("
-            r"recruit(?:s|ed|ing)?|recruiter|"
-            r"who\s+(?:all\s+)?(?:did|has|have)\b.*\b(?:recruit|submit|hire|interview)|"
-            r"candidates?\s+(?:for|of|under)|"
-            r"who\s+(?:all\s+)?(?:they|he|she)\s+recruit|"
-            r"(?:for|by)\s+this\s+user|"
-            r"worked\s+on|their\s+candidates|"
-            # "how many submits/hires/clients did Jordan make/get"
-            r"how\s+many\s+"
-            r"(?:submits?|submittals?|submissions?|hires?|interviews?|rejects?|"
-            r"clients?|candidates?|placements?|offers?)"
-            r"\b.*\b(?:did|has|have|made|got|get)\b|"
-            # "submits Jordan made" / "submittals by Priya" / "hires for this user"
-            r"(?:submits?|submittals?|submissions?|hires?|interviews?|rejects?|"
-            r"placements?)\s+(?:did|for|by|from)\b|"
-            r"(?:did|made|got)\s+.+\s+"
-            r"(?:submit|submittal|hire|interview|place|recruit)"
-            r")\b",
+            r"\b(how\s+many|count|number\s+of|total\s+#?|totals?)\b",
             text,
             re.IGNORECASE,
         )
     )
 
 
+def datavista_stage(question):
+    """Return submittal|interview|hire|reject|None from the question."""
+    text = (question or "").lower()
+    if re.search(r"\b(submittal|submittals|submitted|submit|submits|submission|submissions)\b", text):
+        return "submittal"
+    if re.search(r"\b(interview|interviews|interviewed)\b", text):
+        return "interview"
+    if re.search(r"\b(reject|rejects|rejected|rejection)\b", text):
+        return "reject"
+    if re.search(
+        r"\b(hire|hires|hired|hiring|offer|offers|offered|placement|placements|"
+        r"placement\s*date|offer\s*date|hire\s*date|start\s*date|bill\s*rate)\b",
+        text,
+    ):
+        return "hire"
+    return None
+
+
 def datavista_table_guidance(question):
     text = (question or "").lower()
+    stage = datavista_stage(question)
+    count_mode = is_count_question(question)
 
-    if is_recruiter_question(question) or re.search(
-        r"\b(how\s+many\s+clients?|clients?\s+did|performance|placed|placements?\s+did)\b",
-        text,
-    ):
+    recruiter_filter = (
+        "Treat the named person as the USER/RECRUITER only (never as a candidate). "
+        "Filter PRIMARYRECRUITERNAME / USERFIRSTNAME / USERLASTNAME / userid. "
+    )
+
+    if stage == "submittal":
+        if count_mode:
+            return (
+                "DATABASE: DataVista. TABLE: CR_SubmittalMaster ONLY. "
+                + recruiter_filter
+                + "The user asked HOW MANY submittals. "
+                "Return exactly: SELECT COUNT(*) AS submittal_count FROM "
+                "DataVista.dbo.CR_SubmittalMaster with recruiter + SUBMITTALDATE filters. "
+                "Do NOT UNION interview/hire/reject tables. "
+                "Do NOT return detail rows — only the count."
+            )
         return (
-            "DATABASE: DataVista (recruiting/performance). "
-            "This is a recruiter/user performance question. Treat the named person as the "
-            "user/recruiter. Filter PRIMARYRECRUITERNAME / USERFIRSTNAME / USERLASTNAME / userid. "
-            "Return candidate/client results with light info "
-            "(candidate name, company, job title, pay rate, location, stage date). "
-            "If stage is unnamed, UNION ALL all four CR_* tables with a Stage column. "
-            "For client counts use COUNT(DISTINCT COMPANYNAME)."
+            "DATABASE: DataVista. TABLE: CR_SubmittalMaster ONLY. "
+            + recruiter_filter
+            + "Use SUBMITTALDATE. Do NOT UNION other CR_* tables."
         )
 
-    if re.search(r"\b(placement\s*date|offer\s*date|hire\s*date|received\s+an\s+offer)\b", text):
+    if stage == "interview":
+        if count_mode:
+            return (
+                "DATABASE: DataVista. TABLE: CR_InterviewMaster ONLY. "
+                + recruiter_filter
+                + "Return SELECT COUNT(*) AS interview_count only. No UNION. No detail rows."
+            )
         return (
-            "DATABASE: DataVista. TABLE: CR_HireMaster only. "
-            "Use PLACEMENTDATE (date they received the offer / were placed). "
-            "Do not confuse with STARTDATE."
+            "DATABASE: DataVista. TABLE: CR_InterviewMaster ONLY. "
+            + recruiter_filter
+            + "Use INTERVIEWDATE. Do NOT UNION other CR_* tables."
+        )
+
+    if stage == "reject":
+        if count_mode:
+            return (
+                "DATABASE: DataVista. TABLE: CR_RejectMaster ONLY. "
+                + recruiter_filter
+                + "Return SELECT COUNT(*) AS reject_count only. No UNION. No detail rows."
+            )
+        return (
+            "DATABASE: DataVista. TABLE: CR_RejectMaster ONLY. "
+            + recruiter_filter
+            + "Use INTERNALREJECTDATE / EXTERNALREJECTDATE. Do NOT UNION other CR_* tables."
+        )
+
+    if stage == "hire" or re.search(
+        r"\b(placement\s*date|offer\s*date|hire\s*date|start\s*date|bill\s*rate)\b",
+        text,
+    ):
+        if count_mode:
+            return (
+                "DATABASE: DataVista. TABLE: CR_HireMaster ONLY. "
+                + recruiter_filter
+                + "Return SELECT COUNT(*) AS hire_count only. No UNION. No detail rows. "
+                "PLACEMENTDATE = offer/placement; STARTDATE = work start."
+            )
+        return (
+            "DATABASE: DataVista. TABLE: CR_HireMaster ONLY. "
+            + recruiter_filter
+            + "PLACEMENTDATE = offer/placement date; STARTDATE = work start date. "
+            "Do NOT UNION other CR_* tables."
         )
 
     if re.search(
-        r"\b(start\s*date|started\s+work|first\s+day|came\s+in\s+for\s+work|start\s+work)\b",
+        r"\b(how\s+many\s+clients?|clients?\s+did|performance|placed|placements?\s+did|"
+        r"who\s+did|recruit)\b",
         text,
     ):
         return (
-            "DATABASE: DataVista. TABLE: CR_HireMaster only. "
-            "Use STARTDATE (date they started work). "
-            "Do not confuse with PLACEMENTDATE (offer/placement date)."
-        )
-
-    if re.search(r"\b(interview|interviewed|interviews)\b", text):
-        return (
-            "DATABASE: DataVista. TABLE: CR_InterviewMaster only. "
-            "Use INTERVIEWDATE for interview timing."
-        )
-
-    if re.search(r"\b(submittal|submitted|submit|submission)s?\b", text):
-        return (
-            "DATABASE: DataVista. TABLE: CR_SubmittalMaster only. "
-            "Use SUBMITTALDATE for when they were submitted."
-        )
-
-    if re.search(r"\b(reject|rejected|rejection|rejects)\b", text):
-        return (
-            "DATABASE: DataVista. TABLE: CR_RejectMaster only. "
-            "Use INTERNALREJECTDATE / EXTERNALREJECTDATE and REJECTREASON."
-        )
-
-    if re.search(r"\b(hire[ds]?|hiring|offer(?:ed|s)?|bill\s*rate)\b", text):
-        return (
-            "DATABASE: DataVista. TABLE: CR_HireMaster only. "
-            "PLACEMENTDATE = offer/placement date; STARTDATE = work start date."
+            "DATABASE: DataVista (recruiter/user performance). "
+            + recruiter_filter
+            + "If stage is unnamed, UNION ALL four CR_* tables with a Stage column. "
+            "For client counts use COUNT(DISTINCT COMPANYNAME). "
+            "For how-many without stage, COUNT rows (or DISTINCT candidates) across the UNION."
         )
 
     if re.search(
-        r"\b(pay\s*rate|agreed\s*pay|company(?:\s*name)?|job\s*title|location)\b",
+        r"\b(pay\s*rate|agreed\s*pay|company(?:\s*name)?|job\s*title)\b",
         text,
     ):
         return (
-            "DATABASE: DataVista. Stage unclear — do NOT default to CR_HireMaster. "
-            "UNION ALL CR_SubmittalMaster, CR_InterviewMaster, CR_HireMaster, CR_RejectMaster "
-            "with a Stage column. Return rows where requested fields are present."
+            "DATABASE: DataVista. Named person is the USER/RECRUITER. "
+            "Stage unclear — UNION ALL four CR_* tables with Stage. "
+            "Return rows for that recruiter where the requested fields are present."
         )
 
     return (
-        "DATABASE: DataVista. If pipeline stage is unclear, UNION ALL all four CR_* tables "
-        "with a Stage column. Remember: Prohance is only for attendance/logged hours/breaks."
+        "DATABASE: DataVista. Named person is always the USER/RECRUITER (not a candidate). "
+        "If pipeline stage is unclear, UNION ALL all four CR_* tables with a Stage column. "
+        "If the question says submittal/interview/hire/reject, use THAT table only."
     )
+
+
+def normalize_user_question(question):
+    """
+    Expand shorthand chatbot phrasing into a clearer question.
+    Examples:
+      "disha how many submittals july 26" -> "... July 2026"
+      "submits july 2026" -> "how many submittals in July 2026"
+      "what's disha submittals" -> "how many submittals did disha have"
+    """
+    text = (question or "").strip()
+    if not text:
+        return text
+
+    # Contractions / fillers that must never become names.
+    text = re.sub(r"\bwhat['’]?s\b", "what is", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bwho['’]?s\b", "who is", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bwhere['’]?s\b", "where is", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bhow['’]?s\b", "how is", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bthat['’]?s\b", "that is", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bthere['’]?s\b", "there is", text, flags=re.IGNORECASE)
+
+    stage_words = (
+        r"submits?|submittals?|submissions?|hires?|interviews?|rejects?|"
+        r"clients?|placements?|offers?"
+    )
+
+    # "what is disha submittals" / "what is disha's submittal count"
+    text = re.sub(
+        rf"\bwhat\s+is\s+([A-Za-z][A-Za-z'.-]*)(?:'s)?\s+({stage_words})\b",
+        r"how many \2 did \1 have",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        rf"\bwhat\s+is\s+([A-Za-z][A-Za-z'.-]*)(?:'s)?\s+({stage_words})\s+count\b",
+        r"how many \2 did \1 have",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # july 26 / july '26 -> July 2026
+    months = (
+        "january|february|march|april|may|june|july|august|september|october|"
+        "november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec"
+    )
+
+    def _expand_month_year(match):
+        month = match.group(1)
+        yy = int(match.group(2))
+        year = 2000 + yy if yy < 100 else yy
+        return f"{month} {year}"
+
+    text = re.sub(
+        rf"\b({months})\s+'?(\d{{2}})\b",
+        _expand_month_year,
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    already_count = bool(
+        re.search(r"\b(how\s+many|count|number\s+of)\b", text, re.IGNORECASE)
+    )
+
+    # "submits/submittals July 2026" without how-many -> count question
+    if (
+        not already_count
+        and re.search(rf"\b({stage_words})\b", text, re.I)
+        and re.search(rf"\b({months}|\d{{4}})\b", text, re.I)
+        and not re.search(r"\b(show|list|give|tell)\b", text, re.I)
+    ):
+        text = re.sub(r"\b(submits|submit)\b", "submittals", text, flags=re.I, count=1)
+        text = "how many " + text
+        already_count = True
+
+    # "<name> submittals july 2026" (no how many) -> how many
+    if (
+        not already_count
+        and re.search(rf"\b({stage_words})\b", text, re.I)
+        and not re.search(r"\b(show|list)\b", text, re.I)
+        and extract_name_hints(text)
+    ):
+        text = "how many " + text
+        already_count = True
+
+    # Normalize submit -> submittals for count questions
+    if already_count or re.search(r"\bhow\s+many\b", text, re.I):
+        text = re.sub(r"\bhow\s+many\s+submits\b", "how many submittals", text, flags=re.I)
+        text = re.sub(r"\bhow\s+many\s+submit\b", "how many submittals", text, flags=re.I)
+        text = re.sub(r"\bhow\s+many\s+what\s+is\b", "how many", text, flags=re.I)
+
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def enhance_for_sql(question):
@@ -709,35 +838,12 @@ def format_for_prompt(
     lines.append(f"Active database domain: {domain}")
 
     if domain == "datavista":
-        if is_recruiter_question(question):
-            if confirmed_employee_id:
-                lines.append(
-                    f"The user confirmed recruiter/user id exactly: {confirmed_employee_id}. "
-                    "Filter with userid = that value OR match PRIMARYRECRUITERNAME / USER names for that person. "
-                    "Return the candidates they worked on with light details."
-                )
-            elif confirmed_username:
-                parts = str(confirmed_username).split()
-                if len(parts) >= 2:
-                    first = parts[0]
-                    last = parts[-1]
-                    lines.append(
-                        f"The user confirmed recruiter/user: {confirmed_username}. "
-                        f"Filter WHERE PRIMARYRECRUITERNAME = '{confirmed_username}' "
-                        f"OR (USERFIRSTNAME = '{first}' AND USERLASTNAME = '{last}') "
-                        f"OR (USERFIRSTNAME + ' ' + USERLASTNAME) = '{confirmed_username}'. "
-                        "Return candidate names plus job title, company, pay rate, location, stage/date."
-                    )
-                else:
-                    lines.append(
-                        f"The user confirmed recruiter/user: {confirmed_username}. "
-                        "Match PRIMARYRECRUITERNAME / USERFIRSTNAME / USERLASTNAME to that person "
-                        "and return their candidates with light details."
-                    )
-        elif confirmed_employee_id:
+        # Named people are always the recruiter/user — never candidates.
+        if confirmed_employee_id:
             lines.append(
-                f"The user confirmed they mean CANDIDATEID exactly: {confirmed_employee_id}. "
-                "Use WHERE CANDIDATEID = that exact value."
+                f"The user confirmed recruiter/user id exactly: {confirmed_employee_id}. "
+                "Filter with userid = that value OR match PRIMARYRECRUITERNAME / USER names "
+                "for that person. Never filter candidate name columns."
             )
         elif confirmed_username:
             parts = str(confirmed_username).split()
@@ -745,15 +851,23 @@ def format_for_prompt(
                 first = parts[0]
                 last = parts[-1]
                 lines.append(
-                    f"The user confirmed candidate {confirmed_username}. "
-                    f"Use WHERE CANDIDATEFIRSTNAME = '{first}' "
-                    f"AND CANDIDATELASTNAME = '{last}' (exact match)."
+                    f"The user confirmed recruiter/user: {confirmed_username}. "
+                    f"Filter WHERE PRIMARYRECRUITERNAME = '{confirmed_username}' "
+                    f"OR (USERFIRSTNAME = '{first}' AND USERLASTNAME = '{last}') "
+                    f"OR (USERFIRSTNAME + ' ' + USERLASTNAME) = '{confirmed_username}'. "
+                    "Never filter CANDIDATEFIRSTNAME/CANDIDATELASTNAME for this person."
                 )
             else:
                 lines.append(
-                    f"The user confirmed candidate name: {confirmed_username}. "
-                    "Match CANDIDATEFIRSTNAME / CANDIDATELASTNAME to that person."
+                    f"The user confirmed recruiter/user: {confirmed_username}. "
+                    "Match PRIMARYRECRUITERNAME / USERFIRSTNAME / USERLASTNAME to that person. "
+                    "Never treat them as a candidate."
                 )
+        if is_count_question(question) and datavista_stage(question):
+            lines.append(
+                "COUNT question for a specific stage: return one COUNT(*) value only "
+                "from that stage's table. Do not UNION other stages or return detail rows."
+            )
     else:
         if confirmed_employee_id:
             lines.append(
@@ -1142,6 +1256,22 @@ def clean_sql(sql, actual_table_name="EmployeeAttendance"):
     return repair_select_query(sql)
 
 def fix_username_prefix_match(sql):
+    """
+    Prefer prefix matches for userName.
+    Keep multi-token patterns like '%Akshay%Soni%' intact (only drop the leading %).
+    """
+    def repl_multi(match):
+        quote = match.group(2)
+        body = match.group(3)
+        # '%Akshay%Soni%' -> 'Akshay%Soni%'
+        return f"{match.group(1)} LIKE {quote}{body}{quote}"
+
+    sql = re.sub(
+        r"(\buserName\b)\s+LIKE\s+(['\"])%((?:[^'\"%]+%)+[^'\"%]*)\2",
+        repl_multi,
+        sql,
+        flags=re.IGNORECASE,
+    )
     sql = re.sub(
         r"(\buserName\b)\s+LIKE\s+(['\"])%([^'\"%]+)%\2",
         r"\1 LIKE \2\3%\2",
@@ -1746,6 +1876,9 @@ def extract_name_hints(question):
     text = re.sub(r"\b20\d{2}\b", " ", text)
     text = re.sub(r"\b\d{1,2}[/-]\d{1,2}([/-]\d{2,4})?\b", " ", text)
     text = re.sub(r"[`\"“”]", " ", text)
+    # what's / who's → remove so they never become names
+    text = re.sub(r"\b(what|who|where|how|that|there|here)['’]s\b", r"\1", text, flags=re.I)
+    text = re.sub(r"['’]", "", text)
 
     def clean_name_parts(raw):
         parts = []
@@ -1773,6 +1906,11 @@ def extract_name_hints(question):
         # "Akshay Soni how many hours did he log"
         rf"^\s*{_NAME_SPAN}\s+"
         rf"(?:how|what|when|who|where)\b",
+        # "Disha how many submittals" / "Disha submittals july 2026"
+        rf"^\s*{_NAME_SPAN}\s+"
+        rf"(?:how\s+many\s+)?"
+        rf"(?:submits?|submittals?|submissions?|hires?|interviews?|rejects?|"
+        rf"clients?|placements?|offers?|hours?|breaks?)\b",
         # role markers — name is the next word(s)
         rf"\b(?:candidate|employee|recruiter|user)(?:'s)?\s+{_NAME_SPAN}\b",
         # "for candidate Akshay Soni" / "for employee John"
@@ -1925,14 +2063,21 @@ def score_name_match(hints, full_name):
 
     for hint in hints:
         h = hint.lower()
-        if h in name_l:
+        # Exact full name or exact token (correct spelling) — best score.
+        if name_l == h or h in tokens:
             total += 0
+            continue
+        if name_l.startswith(h + " ") or name_l.endswith(" " + h):
+            total += 0
+            continue
+        if h in name_l:
+            total += 1
             continue
         distances = [levenshtein_distance(h, token) for token in tokens] or [99]
         best = min(distances)
         # Allow 1-2 character typos on a token of similar length.
         if best <= 2 and any(abs(len(h) - len(token)) <= 2 for token in tokens):
-            total += best
+            total += best + 1
             continue
         return None
 
@@ -1962,6 +2107,24 @@ def finalize_name_matches(matches, hints, max_confirm=3):
     best_score = scored[0][0]
     best_matches = [match for score, match in scored if score == best_score]
 
+    # Deduplicate same display name (same person, different userid copies).
+    unique_names = {}
+    for match in best_matches:
+        key = str(match.get("username") or "").strip().lower()
+        unique_names.setdefault(key, match)
+    best_unique = list(unique_names.values())
+
+    # Single unique display name with exact/near-exact score → resolve.
+    if len(best_unique) == 1 and best_score <= 1:
+        match = best_unique[0]
+        employee_id = match.get("employee_id")
+        return (
+            match.get("username"),
+            str(employee_id) if employee_id is not None else None,
+            [],
+            "resolved",
+        )
+
     # Unique clear winner (exact/near-exact, or clearly better than the rest).
     if len(best_matches) == 1:
         if len(scored) == 1 or scored[1][0] > best_score:
@@ -1974,15 +2137,15 @@ def finalize_name_matches(matches, hints, max_confirm=3):
                 "resolved",
             )
 
-    if 2 <= len(best_matches) <= max_confirm and best_score <= 2:
-        return None, None, best_matches[:max_confirm], "confirm"
+    if 2 <= len(best_unique) <= max_confirm and best_score <= 2:
+        return None, None, best_unique[:max_confirm], "confirm"
 
-    if len(best_matches) > max_confirm:
+    if len(best_unique) > max_confirm:
         return None, None, [], "ambiguous"
 
     # Fall back to the single closest name if it's within 2 edits.
-    if best_score <= 2:
-        match = scored[0][1]
+    if best_score <= 2 and len(best_unique) == 1:
+        match = best_unique[0]
         employee_id = match.get("employee_id")
         return (
             match.get("username"),
@@ -2201,28 +2364,40 @@ def find_matching_candidates(name_hints, limit=20):
     return matches
 
 
-def _recruiter_name_where(name_hints):
+def _recruiter_name_where(name_hints, mode="contains"):
+    """
+    mode:
+      exact — first/last/full equality and 'First %' prefix on full name
+      contains — LIKE %hint% (broader)
+    """
     clauses = []
     for hint in name_hints:
         safe = sql_literal(hint)
-        clauses.append(
-            "("
-            f"PRIMARYRECRUITERNAME LIKE '%{safe}%' "
-            f"OR USERFIRSTNAME LIKE '%{safe}%' "
-            f"OR USERLASTNAME LIKE '%{safe}%' "
-            f"OR (USERFIRSTNAME + ' ' + USERLASTNAME) LIKE '%{safe}%'"
-            ")"
-        )
+        if mode == "exact":
+            clauses.append(
+                "("
+                f"LTRIM(RTRIM(PRIMARYRECRUITERNAME)) = '{safe}' "
+                f"OR LTRIM(RTRIM(USERFIRSTNAME)) = '{safe}' "
+                f"OR LTRIM(RTRIM(USERLASTNAME)) = '{safe}' "
+                f"OR LTRIM(RTRIM(USERFIRSTNAME)) + ' ' + LTRIM(RTRIM(USERLASTNAME)) = '{safe}' "
+                f"OR PRIMARYRECRUITERNAME LIKE '{safe} %' "
+                f"OR USERFIRSTNAME LIKE '{safe}' "
+                f"OR (USERFIRSTNAME + ' ' + USERLASTNAME) LIKE '{safe} %'"
+                ")"
+            )
+        else:
+            clauses.append(
+                "("
+                f"PRIMARYRECRUITERNAME LIKE '%{safe}%' "
+                f"OR USERFIRSTNAME LIKE '%{safe}%' "
+                f"OR USERLASTNAME LIKE '%{safe}%' "
+                f"OR (USERFIRSTNAME + ' ' + USERLASTNAME) LIKE '%{safe}%'"
+                ")"
+            )
     return " AND ".join(clauses)
 
 
-def find_matching_recruiters(name_hints, limit=20):
-    """Match DataVista users/recruiters across CR_* tables."""
-    if not name_hints:
-        return []
-
-    db_name = get_datavista_database_name()
-    where_sql = _recruiter_name_where(name_hints)
+def _recruiter_selects(db_name, where_sql):
     selects = []
     for table in DATAVISTA_TABLES:
         selects.append(
@@ -2238,63 +2413,61 @@ def find_matching_recruiters(name_hints, limit=20):
             WHERE {where_sql}
             """
         )
+    return selects
 
-    sql = f"""
-        SELECT DISTINCT TOP ({int(limit)}) username, employee_id
-        FROM (
-            {" UNION ALL ".join(selects)}
-        ) AS people
-        WHERE LTRIM(RTRIM(username)) <> ''
-        ORDER BY username, employee_id
-    """
 
-    try:
-        rows = execute_sql(sql)
-    except Exception:
-        rows = []
+def find_matching_recruiters(name_hints, limit=20):
+    """Match DataVista users/recruiters across CR_* tables. Prefer exact names."""
+    if not name_hints:
+        return []
 
-    if not rows:
-        fuzzy_selects = []
-        for table in DATAVISTA_TABLES:
-            fuzzy_parts = []
-            for hint in name_hints:
-                safe = sql_literal(hint)
-                prefix = sql_literal(hint[: max(2, min(3, len(hint)))])
-                fuzzy_parts.append(
-                    "("
-                    f"PRIMARYRECRUITERNAME LIKE '%{prefix}%' "
-                    f"OR USERFIRSTNAME LIKE '%{prefix}%' "
-                    f"OR USERLASTNAME LIKE '%{prefix}%' "
-                    f"OR DIFFERENCE(CAST(PRIMARYRECRUITERNAME AS NVARCHAR(400)), '{safe}') >= 3 "
-                    f"OR DIFFERENCE(CAST(USERFIRSTNAME AS NVARCHAR(400)), '{safe}') >= 3 "
-                    f"OR DIFFERENCE(CAST(USERLASTNAME AS NVARCHAR(400)), '{safe}') >= 3"
-                    ")"
-                )
-            fuzzy_selects.append(
-                f"""
-                SELECT DISTINCT
-                    COALESCE(
-                        NULLIF(LTRIM(RTRIM(PRIMARYRECRUITERNAME)), ''),
-                        LTRIM(RTRIM(COALESCE(USERFIRSTNAME, ''))) + ' ' +
-                        LTRIM(RTRIM(COALESCE(USERLASTNAME, '')))
-                    ) AS username,
-                    userid AS employee_id
-                FROM [{db_name}].[dbo].[{table}]
-                WHERE {" AND ".join(fuzzy_parts)}
-                """
-            )
-        fuzzy_sql = f"""
-            SELECT DISTINCT TOP (80) username, employee_id
+    db_name = get_datavista_database_name()
+
+    def run_where(where_sql, top=None):
+        top_n = int(top or limit)
+        sql = f"""
+            SELECT DISTINCT TOP ({top_n}) username, employee_id
             FROM (
-                {" UNION ALL ".join(fuzzy_selects)}
+                {" UNION ALL ".join(_recruiter_selects(db_name, where_sql))}
             ) AS people
             WHERE LTRIM(RTRIM(username)) <> ''
             ORDER BY username, employee_id
         """
         try:
-            rows = execute_sql(fuzzy_sql)
+            return execute_sql(sql)
         except Exception:
             return []
+
+    # 1) Exact / prefix match first (correct spelling should hit here).
+    rows = run_where(_recruiter_name_where(name_hints, mode="exact"))
+
+    # 2) Contains match.
+    if not rows:
+        rows = run_where(_recruiter_name_where(name_hints, mode="contains"))
+
+    # 3) If full name failed, try first token only (exact then contains).
+    if not rows and len(name_hints) > 1:
+        rows = run_where(_recruiter_name_where([name_hints[0]], mode="exact"))
+        if not rows:
+            rows = run_where(_recruiter_name_where([name_hints[0]], mode="contains"))
+
+    # 4) Fuzzy fallback last.
+    if not rows:
+        fuzzy_parts = []
+        for hint in name_hints:
+            safe = sql_literal(hint)
+            prefix = sql_literal(hint[: max(2, min(3, len(hint)))])
+            fuzzy_parts.append(
+                "("
+                f"PRIMARYRECRUITERNAME LIKE '{prefix}%' "
+                f"OR USERFIRSTNAME LIKE '{prefix}%' "
+                f"OR USERLASTNAME LIKE '{prefix}%' "
+                f"OR DIFFERENCE(CAST(PRIMARYRECRUITERNAME AS NVARCHAR(400)), '{safe}') >= 4 "
+                f"OR DIFFERENCE(CAST(USERFIRSTNAME AS NVARCHAR(400)), '{safe}') >= 4 "
+                f"OR DIFFERENCE(CAST(USERLASTNAME AS NVARCHAR(400)), '{safe}') >= 4"
+                ")"
+            )
+        rows = run_where(" AND ".join(fuzzy_parts), top=80)
 
     seen = set()
     matches = []
@@ -2309,21 +2482,6 @@ def find_matching_recruiters(name_hints, limit=20):
         seen.add(dedupe_key)
         matches.append({"username": username, "employee_id": employee_id})
     return matches
-
-
-def resolve_candidate_from_question(question, confirmed_username, confirmed_employee_id):
-    if confirmed_employee_id or confirmed_username:
-        return confirmed_username, confirmed_employee_id, [], "resolved"
-
-    hints = extract_name_hints(question)
-    if not hints:
-        return None, None, [], "none"
-
-    matches = find_matching_candidates(hints)
-    if not matches and len(hints) > 1:
-        matches = find_matching_candidates([hints[0]])
-
-    return finalize_name_matches(matches, hints)
 
 
 def resolve_recruiter_from_question(question, confirmed_username, confirmed_employee_id):
@@ -2343,7 +2501,8 @@ def resolve_recruiter_from_question(question, confirmed_username, confirmed_empl
 
 def resolve_person_from_question(question, primary_table, confirmed_username, confirmed_employee_id):
     """
-    Resolve a named person in Prohance (employees) or DataVista (candidates/recruiters).
+    Resolve a named person in Prohance (employees) or DataVista (recruiters/users).
+    DataVista never resolves candidate names — only recruiter/user names.
     Returns (username, id, matches, domain, status).
     """
     domain = detect_question_domain(question)
@@ -2355,13 +2514,7 @@ def resolve_person_from_question(question, primary_table, confirmed_username, co
         return None, None, [], domain, "none"
 
     if domain == "datavista":
-        if is_recruiter_question(question):
-            username, person_id, matches, status = resolve_recruiter_from_question(
-                question, confirmed_username, confirmed_employee_id
-            )
-            return username, person_id, matches, "datavista", status
-
-        username, person_id, matches, status = resolve_candidate_from_question(
+        username, person_id, matches, status = resolve_recruiter_from_question(
             question, confirmed_username, confirmed_employee_id
         )
         return username, person_id, matches, "datavista", status
@@ -2373,7 +2526,6 @@ def resolve_person_from_question(question, primary_table, confirmed_username, co
         )
         return username, person_id, matches, "prohance", status
 
-    # DataVista (default for non-attendance): recruiters/candidates already handled above.
     return (
         None,
         None,
@@ -2942,6 +3094,7 @@ def ask_question():
     payload = request.get_json(silent=True) or {}
     question, history, confirmed_username, confirmed_employee_id = parse_chat_request(payload)
     last_result = parse_last_result(payload)
+    question = normalize_user_question(question)
 
     if not question.strip():
         return jsonify({"error": 'Send JSON like { "message": "your question", "history": [] }.'})
