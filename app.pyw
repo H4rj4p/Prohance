@@ -207,7 +207,9 @@ class SchemaProvider:
             "\n-- IMPORTANT: logged_hours and aafs*/break duration columns are often "
             "stored as VARCHAR 'HH:MM:SS' (example '00:53:45'). "
             "Convert to seconds with DATEDIFF(SECOND, 0, TRY_CAST(... AS TIME)) "
-            "before AVG, SUM, or addition. Never COALESCE(column, 0) on those varchar times.\n"
+            "before AVG, SUM, or addition. Never COALESCE(column, 0) on those varchar times. "
+            "For totals/averages return INTEGER seconds (total_seconds / avg_seconds). "
+            "Do not CONVERT aggregates back to TIME — TIME wraps at 24 hours.\n"
         )
 
         live_schema = self._load_schema_from_database()
@@ -597,8 +599,10 @@ def enhance_for_sql(question):
         notes.append(
             "IMPORTANT: The user asked for an aggregate. Use AVG/SUM in SQL over matching rows. "
             "Do NOT return only the first raw row. "
-            "Duration fields may be VARCHAR 'HH:MM:SS' — convert to seconds before AVG/SUM, "
-            "then convert the result back to HH:MM:SS for display."
+            "Duration fields may be VARCHAR 'HH:MM:SS' — convert to seconds before AVG/SUM. "
+            "Return the aggregate as INTEGER seconds (alias total_seconds or avg_seconds). "
+            "NEVER CONVERT/DATEADD back to TIME/HH:MM:SS for totals — SQL TIME wraps at 24 hours "
+            "and month totals would be wrong. The app formats seconds into days/weeks/hours."
         )
 
     if re.search(
@@ -608,7 +612,9 @@ def enhance_for_sql(question):
     ):
         notes.append(
             "IMPORTANT: Break/AAFS/logged_hours values look like '00:53:45'. "
-            "Never COALESCE(column, 0) or AVG(column) directly on those varchar times."
+            "Never COALESCE(column, 0) or AVG(column) directly on those varchar times. "
+            "For total logged hours / total breaks in a week or month, SUM the seconds and "
+            "return total_seconds only (no TIME convert)."
         )
 
     if detect_question_domain(question) == "datavista":
@@ -1111,6 +1117,7 @@ def clean_sql(sql, actual_table_name="EmployeeAttendance"):
     sql = fix_datavista_schema(sql)
     sql = qualify_datavista_sql(sql)
     sql = convert_limit_to_top(sql)
+    sql = rewrite_duration_time_converts(sql)
     sql = ensure_single_readonly_sql(sql)
     return repair_select_query(sql)
 
@@ -1208,6 +1215,102 @@ def convert_limit_to_top(sql):
         count=1,
         flags=re.IGNORECASE,
     )
+
+
+def _extract_balanced_call(sql, start_index):
+    """Given index at the '(' of a function call, return (inner, end_index_exclusive)."""
+    if start_index >= len(sql) or sql[start_index] != "(":
+        return None, start_index
+    depth = 0
+    in_quote = False
+    i = start_index
+    while i < len(sql):
+        ch = sql[i]
+        if in_quote:
+            if ch == "'" and i + 1 < len(sql) and sql[i + 1] == "'":
+                i += 2
+                continue
+            if ch == "'":
+                in_quote = False
+            i += 1
+            continue
+        if ch == "'":
+            in_quote = True
+            i += 1
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return sql[start_index + 1 : i], i + 1
+        i += 1
+    return None, start_index
+
+
+def rewrite_duration_time_converts(sql):
+    """
+    Replace CONVERT(varchar(...), DATEADD(SECOND, <expr>, 0), 108) with <expr>
+    so aggregates are returned as seconds instead of TIME (which wraps at 24h).
+    """
+    if not sql or not re.search(r"\bDATEADD\s*\(\s*SECOND\b", sql, re.IGNORECASE):
+        return sql
+
+    pattern = re.compile(r"\bCONVERT\s*\(", re.IGNORECASE)
+    pieces = []
+    cursor = 0
+    for match in pattern.finditer(sql):
+        convert_open = match.end() - 1  # index of '('
+        convert_args, convert_end = _extract_balanced_call(sql, convert_open)
+        if convert_args is None:
+            continue
+
+        # Expect: varchar(...), DATEADD(SECOND, <expr>, 0), 108
+        dateadd_match = re.search(r"\bDATEADD\s*\(", convert_args, re.IGNORECASE)
+        if not dateadd_match:
+            continue
+        # varchar style first arg and style 108 somewhere
+        if not re.search(r"\bvarchar\b", convert_args, re.IGNORECASE):
+            continue
+        if not re.search(r",\s*108\s*$", convert_args.strip(), re.IGNORECASE):
+            continue
+
+        dateadd_open = match.start() + dateadd_match.end() - 1
+        # dateadd_open is absolute? match.start() is CONVERT start; dateadd_match is in convert_args
+        dateadd_open = (convert_open + 1) + dateadd_match.end() - 1
+        dateadd_args, dateadd_end = _extract_balanced_call(sql, dateadd_open)
+        if dateadd_args is None:
+            continue
+        if not re.match(r"^\s*SECOND\s*,", dateadd_args, re.IGNORECASE):
+            continue
+
+        # SECOND, <expr>, 0
+        inner = re.sub(r"^\s*SECOND\s*,\s*", "", dateadd_args, count=1, flags=re.IGNORECASE)
+        inner = re.sub(r",\s*0\s*$", "", inner, count=1).strip()
+        if not inner:
+            continue
+
+        # Prefer casting rounded expressions to int seconds.
+        replacement = inner
+        alias_hint = ""
+        # Preserve AS alias after the CONVERT(...) if present
+        alias_match = re.match(r"\s+AS\s+([A-Za-z_][\w]*)", sql[convert_end:], re.IGNORECASE)
+        if alias_match:
+            alias_name = alias_match.group(1)
+            convert_end = convert_end + alias_match.end()
+            if not re.search(r"second", alias_name, re.IGNORECASE):
+                alias_hint = f" AS {alias_name}_seconds"
+            else:
+                alias_hint = f" AS {alias_name}"
+        else:
+            alias_hint = " AS total_seconds"
+
+        pieces.append(sql[cursor:match.start()])
+        pieces.append(f"{replacement}{alias_hint}")
+        cursor = convert_end
+
+    pieces.append(sql[cursor:])
+    return "".join(pieces)
 
 
 def strip_comments(sql):
@@ -1354,6 +1457,138 @@ def make_json_value(value):
     return value
 
 
+def format_duration_seconds(seconds):
+    """
+    Human duration that does not wrap at 24 hours.
+    Examples: "3 hours 15 minutes", "1 day 3 hours", "2 weeks 23 hours and 10 minutes"
+    """
+    try:
+        total = int(round(float(seconds)))
+    except (TypeError, ValueError):
+        return None
+    if total < 0:
+        total = 0
+
+    weeks, rem = divmod(total, 7 * 24 * 3600)
+    days, rem = divmod(rem, 24 * 3600)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+
+    parts = []
+    if weeks:
+        parts.append(f"{weeks} week{'s' if weeks != 1 else ''}")
+    if days:
+        parts.append(f"{days} day{'s' if days != 1 else ''}")
+    if hours:
+        parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
+    if minutes:
+        parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+    if not parts:
+        if secs:
+            parts.append(f"{secs} second{'s' if secs != 1 else ''}")
+        else:
+            return "0 minutes"
+
+    if len(parts) == 1:
+        return parts[0]
+    if len(parts) == 2:
+        return f"{parts[0]} and {parts[1]}"
+    return f"{', '.join(parts[:-1])}, and {parts[-1]}"
+
+
+def parse_hhmmss_to_seconds(value):
+    """Parse 'HH:MM:SS' / 'H:MM:SS' into seconds. Returns None if not a time string."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    match = re.fullmatch(r"(\d{1,4}):([0-5]?\d):([0-5]?\d)", text)
+    if not match:
+        return None
+    hours, minutes, seconds = (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def _is_seconds_column(name):
+    key = re.sub(r"[^a-z0-9]+", "", (name or "").lower())
+    return key.endswith("seconds") or key.endswith("secs") or key in {
+        "totalseconds",
+        "avgseconds",
+        "loggedseconds",
+        "breakseconds",
+        "durationseconds",
+        "sumseconds",
+    }
+
+
+def _is_duration_label_column(name):
+    key = re.sub(r"[^a-z0-9]+", "", (name or "").lower())
+    return any(
+        token in key
+        for token in (
+            "loggedhour",
+            "totalhour",
+            "totalbreak",
+            "avgbreak",
+            "avglogged",
+            "duration",
+            "totaltime",
+            "breaktime",
+        )
+    ) or key in {
+        "loggedhours",
+        "logged_hours",
+        "totalhours",
+        "avghours",
+        "hours",
+    }
+
+
+def enrich_duration_results(results):
+    """
+    Add human-readable duration fields so totals > 24h don't look like clock times.
+    Prefers *_seconds columns; also formats HH:MM:SS duration aggregates.
+    """
+    if not results:
+        return results
+
+    enriched = []
+    for row in results:
+        new_row = dict(row)
+        for key, value in list(row.items()):
+            label_key = None
+            seconds = None
+
+            if _is_seconds_column(key) and value is not None:
+                try:
+                    seconds = float(value)
+                except (TypeError, ValueError):
+                    seconds = None
+                if seconds is not None:
+                    base = re.sub(r"_?seconds?$", "", key, flags=re.IGNORECASE)
+                    label_key = f"{base}_duration" if base and base != key else "duration"
+
+            elif value is not None and _is_duration_label_column(key):
+                seconds = parse_hhmmss_to_seconds(value)
+                if seconds is not None:
+                    # Keep original clock string only when under 24h; always add readable label.
+                    label_key = f"{key}_duration" if not key.lower().endswith("duration") else key
+
+            if seconds is None or label_key is None:
+                continue
+
+            readable = format_duration_seconds(seconds)
+            if not readable:
+                continue
+            new_row[label_key] = readable
+            # For second totals, also expose a friendly primary label when missing.
+            if _is_seconds_column(key) and "duration" not in {
+                str(k).lower() for k in new_row.keys()
+            }:
+                new_row["duration"] = readable
+        enriched.append(new_row)
+    return enriched
+
+
 def execute_sql(sql_query):
     results = []
     with open_sql_server_connection() as connection:
@@ -1461,7 +1696,7 @@ def sql_literal(value):
 
 # Verbs / question words that end a person-name span.
 _NAME_TAIL_VERBS = (
-    r"make|made|makes|making|get|got|gets|getting|give|gave|gave|"
+    r"make|made|makes|making|get|got|gets|getting|give|gave|given|"
     r"log|logs|logged|logging|work|works|worked|working|"
     r"have|has|had|submit|submits|submitted|hire|hired|recruit|recruited|"
     r"show|list|tell|do|does|did|is|are|was|were|can|could|would|should|"
@@ -2447,7 +2682,10 @@ def generate_sql(
             "Duration columns like logged_hours and aafs* breaks are often VARCHAR 'HH:MM:SS'. "
             "Never COALESCE them with 0 or AVG them directly. Convert to seconds with "
             "DATEDIFF(SECOND, 0, TRY_CAST(... AS TIME)) before AVG/SUM/addition. "
-            "If the user asks for an average, the SQL MUST include AVG(...) and GROUP BY when needed."
+            "For SUM/total of durations (month/week totals), return total_seconds as an integer. "
+            "Do NOT CONVERT seconds back to TIME/varchar HH:MM:SS — TIME wraps at 24 hours. "
+            "If the user asks for an average, the SQL MUST include AVG(...) and GROUP BY when needed, "
+            "and should return avg_seconds (integer), not a TIME string."
         )
 
     raw = get_openai_completion(
@@ -2503,7 +2741,10 @@ def generate_answer(
     answer_examples = (
         "\"Akshay Soni was hired at Acme for Software Engineer on 2026-07-12.\""
         if domain == "datavista"
-        else "\"Akshay Soni averaged 32.5 logged hours this month.\""
+        else (
+            "\"Akshay Soni logged 1 week 2 days and 3 hours in July.\" "
+            "or \"Akshay Soni averaged 8 hours and 12 minutes per day this month.\""
+        )
     )
 
     try:
@@ -2513,6 +2754,10 @@ def generate_answer(
                 "Reply with ONLY 1-2 short natural-language sentences. "
                 f"Lead with the direct answer in plain English, like: {answer_examples} "
                 "Include the person's full name when available, the key number/date, and the period asked about. "
+                "When a *_duration or duration field is present (for example "
+                "'1 week 2 days and 3 hours'), USE THAT exact wording for time totals — "
+                "do not convert seconds yourself and do not quote HH:MM:SS clock times for "
+                "totals that can exceed 24 hours. "
                 "Do not use markdown, bullets, headings, or tables. "
                 "Do not list rows or repeat every column — the UI already shows the data table underneath. "
                 "If the data is empty, say no matching records were found. "
@@ -2815,7 +3060,7 @@ def ask_question():
                 }
             )
 
-        results = execute_sql(sql_query)
+        results = enrich_duration_results(execute_sql(sql_query))
         candidates = get_candidates(results)
         if should_confirm(candidates, question, confirmed_employee_id, confirmed_username):
             hint_text = " ".join(extract_name_hints(question)) or "that name"

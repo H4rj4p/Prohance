@@ -10,12 +10,26 @@ FROM EmployeeAttendance
 WHERE sessionDate = CAST(DATEADD(day, -1, GETDATE()) AS DATE)
 ORDER BY logged_seconds DESC;
 
--- Average logged hours for one employee this month
+-- Total logged hours for one employee this month
+-- Return SECONDS only — never CONVERT to TIME (wraps at 24 hours).
 SELECT
   userName,
-  CONVERT(varchar(8), DATEADD(SECOND, CAST(ROUND(AVG(
+  SUM(
     COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(logged_hours)), '') AS TIME)), 0)
-  ), 0) AS int), 0), 108) AS avg_logged_hours,
+  ) AS total_seconds,
+  COUNT(*) AS session_count
+FROM EmployeeAttendance
+WHERE userName LIKE '%Akshay%Soni%'
+  AND sessionDate >= DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1)
+  AND sessionDate < DATEADD(month, 1, DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1))
+GROUP BY userName;
+
+-- Average logged hours for one employee this month (seconds; app formats duration)
+SELECT
+  userName,
+  CAST(ROUND(AVG(
+    COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(logged_hours)), '') AS TIME)), 0)
+  ), 0) AS int) AS avg_seconds,
   COUNT(*) AS session_count
 FROM EmployeeAttendance
 WHERE userName LIKE '%Harzh%Mevada%'
@@ -26,12 +40,12 @@ GROUP BY userName;
 -- Average total break for one employee in July 2026
 SELECT
   userName,
-  CONVERT(varchar(8), DATEADD(SECOND, CAST(ROUND(AVG(
+  CAST(ROUND(AVG(
     COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(aafsBreak)), '') AS TIME)), 0)
     + COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(aafsLunchBreak)), '') AS TIME)), 0)
     + COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(aafsShortBreak)), '') AS TIME)), 0)
     + COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(aafsPersonalTime)), '') AS TIME)), 0)
-  ), 0) AS int), 0), 108) AS avg_total_break,
+  ), 0) AS int) AS avg_seconds,
   COUNT(*) AS session_count
 FROM EmployeeAttendance
 WHERE userName LIKE '%Harzh%Mevada%'
@@ -46,23 +60,18 @@ WHERE userName LIKE '%John%'
   AND late_login = 1
 ORDER BY sessionDate DESC;
 
--- Break averages by employee this month
+-- Break averages by employee this month (seconds)
 SELECT
   userName,
-  CONVERT(varchar(8), DATEADD(SECOND, CAST(ROUND(AVG(
+  CAST(ROUND(AVG(
     COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(aafsBreak)), '') AS TIME)), 0)
     + COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(aafsLunchBreak)), '') AS TIME)), 0)
     + COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(aafsShortBreak)), '') AS TIME)), 0)
     + COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(aafsPersonalTime)), '') AS TIME)), 0)
-  ), 0) AS int), 0), 108) AS avg_total_break,
+  ), 0) AS int) AS avg_seconds,
   COUNT(*) AS session_count
 FROM EmployeeAttendance
 WHERE sessionDate >= DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1)
   AND sessionDate < DATEADD(month, 1, DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1))
 GROUP BY userName
-ORDER BY AVG(
-  COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(aafsBreak)), '') AS TIME)), 0)
-  + COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(aafsLunchBreak)), '') AS TIME)), 0)
-  + COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(aafsShortBreak)), '') AS TIME)), 0)
-  + COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(aafsPersonalTime)), '') AS TIME)), 0)
-) DESC;
+ORDER BY avg_seconds DESC;

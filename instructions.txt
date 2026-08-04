@@ -66,11 +66,17 @@ ALWAYS convert to seconds first:
 
   DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(column)), '') AS TIME))
 
-Then AVG/SUM, then convert back with:
+Then AVG/SUM and return the result as INTEGER seconds, e.g.:
+  SUM(...) AS total_seconds
+  AVG(...) AS avg_seconds
 
-  CONVERT(varchar(8), DATEADD(SECOND, CAST(ROUND(avg_seconds, 0) AS int), 0), 108)
+Do NOT convert aggregates back with CONVERT/DATEADD to TIME or 'HH:MM:SS'.
+SQL Server TIME wraps at 24 hours, so month/week totals would be wrong
+(e.g. 160 hours would show as ~16:00:00). The app formats seconds into
+human text like "1 week 2 days and 3 hours".
 
-For total breaks, sum the four break categories in seconds, then average across days if asked.
+For total breaks, sum the four break categories in seconds, then SUM or AVG
+across days as asked — still return seconds only.
 
 ## Breaks
 When asked about breaks / break time / average break / total breaks:
@@ -86,6 +92,8 @@ When asked about breaks / break time / average break / total breaks:
 - "Top employees by logged hours this week"
 
 ## Response style
+For duration totals, prefer human wording from the duration field
+(e.g. "1 day 3 hours", "2 weeks 23 hours and 10 minutes"), not clock HH:MM:SS.
 After the query runs, answer in 1-2 short natural sentences first, e.g.
 "Akshay Soni averaged 08:15:00 logged hours this month across 18 sessions."
 Never invent values. If no rows, say no matching records were found.
