@@ -1,12 +1,16 @@
 # Prohance / IRI AI
 
-Flask chatbot that answers natural-language questions about IRI workforce data in SQL Server (attendance, logins, breaks, AAFS, shifts).
+Flask chatbot for IRI data in SQL Server:
+
+- **Prohance** — workforce attendance (logins, breaks, AAFS, shifts)
+- **DataVista** — recruiting pipeline (hires, interviews, rejects, submittals) on the same server
 
 ## Setup
 
 1. Install dependencies: `pip install -r requirements.txt`
-2. Configure `local.settings.json` with `SqlConnectionString`, optional `SqlServerHost`, and `OpenAIApiKey`
-3. Run: `python app.pyw`
-4. Open `http://localhost:7179/api/Chat`
+2. Configure `local.settings.json` with `SqlConnectionString` (Prohance), optional `SqlServerHost`, and `OpenAIApiKey`
+3. Optional: `DataVistaDatabase` (defaults to `DataVista`) if the database name differs
+4. Run: `python app.pyw`
+5. Open `http://localhost:7179/api/Chat`
 
-The SQL connection layer is unchanged. Schema is loaded from the live database when available, with `schema.sql` / `instructions.txt` / `sample_queries.txt` guiding SQL generation.
+The SQL connection layer is unchanged. DataVista is queried with three-part names (`DataVista.dbo.CR_HireMaster`, etc.) over the same connection, so the SQL login needs read access to both databases.

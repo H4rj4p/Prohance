@@ -303,8 +303,8 @@
     <div class="row bot">
       <div class="avatar">AI</div>
       <div class="bubble" id="welcome">
-        Hi! I'm IRI AI. Ask questions about employee attendance, logins, breaks, AAFS, and shifts in plain English.
-        <div class="meta">Example: "Who logged in late yesterday?" or "Show total break time by employee this week"</div>
+        Hi! I'm IRI AI. Ask about Prohance attendance (logins, breaks, AAFS, shifts) or DataVista recruiting (hires, interviews, rejects, submittals, who a recruiter worked with).
+        <div class="meta">Examples: "Who logged in late yesterday?" · "Who did Jordan recruit?" · "Agreed pay rate and company for Akshay"</div>
       </div>
     </div>
   </div>
@@ -363,11 +363,26 @@
         const res = await fetch(`${base}/api/TestSqlConnection`);
         const data = await res.json();
         if (data.success) {
-          status.textContent = `Connected: ${data.database}`;
-          status.className = "ok";
+          const dvName = data.datavistaDatabase || "DataVista";
+          const dvOk = !!data.datavistaOk;
+          status.textContent = dvOk
+            ? `Connected: ${data.database} + ${dvName}`
+            : `Connected: ${data.database} (no ${dvName} access)`;
+          status.className = dvOk ? "ok" : "bad";
           const welcome = document.getElementById("welcome");
           if (welcome) {
-            welcome.innerHTML = `Hi! I'm IRI AI. You're connected to <strong>${escapeHtml(data.database)}</strong>. Ask anything about your data in plain English.`;
+            if (dvOk) {
+              welcome.innerHTML =
+                `Hi! I'm IRI AI. You're connected to <strong>${escapeHtml(data.database)}</strong> ` +
+                `and can also read <strong>${escapeHtml(dvName)}</strong>. ` +
+                `Ask about attendance or recruiting in plain English.`;
+            } else {
+              welcome.innerHTML =
+                `Hi! I'm IRI AI. You're connected to <strong>${escapeHtml(data.database)}</strong>, ` +
+                `but I can't read <strong>${escapeHtml(dvName)}</strong> yet.<div class="meta">` +
+                `${escapeHtml(data.datavistaError || "Grant this SQL login read access to DataVista, then restart.")}` +
+                `</div>`;
+            }
           }
         } else {
           status.textContent = "DB not connected";
