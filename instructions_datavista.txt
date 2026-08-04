@@ -179,6 +179,10 @@ Use COUNT / COUNT(DISTINCT ...) / AVG / SUM when the question asks how many / av
 - "How many" questions MUST be `SELECT COUNT(*) ...` or `SELECT COUNT(DISTINCT ...) ...` — never omit the SELECT keyword.
 - No markdown, no explanation, no DECLARE/USE/SET/INSERT/UPDATE/DELETE.
 - Prefer DATEFROMPARTS / TRY_CONVERT inline for "this month" filters (do not use DECLARE variables).
+- Submittal date column is SUBMITTALDATE (never SubmitDate / SubmissionDate).
+- Recruiter column is PRIMARYRECRUITERNAME (never RecruiterName alone).
+- Example month filter:
+  TRY_CONVERT(date, SUBMITTALDATE) >= DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1)
 - After results: 1-2 short natural sentences first, e.g.
   "Jordan Lee submitted 14 candidates this month across 9 companies."
   "John Smith's placement date was 2026-07-12 and his start date is 2026-08-04."

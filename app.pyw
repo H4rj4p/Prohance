@@ -808,9 +808,9 @@ def _strip_sql_wrapper_noise(sql):
     sql = sql.strip().rstrip(";").strip()
     sql = re.sub(r"^\s*BEGIN\s+", "", sql, flags=re.IGNORECASE)
     sql = re.sub(r"\s+END\s*$", "", sql, flags=re.IGNORECASE)
-    # Leftover from {"query":"..."} when extraction fell through to regex.
-    # Only strip quote/brace crumbs — never bare ], which is valid in [table].
-    sql = re.sub(r'["\']+\s*[}\]]*\s*$', "", sql).strip()
+    # Leftover from {"query":"..."} only — never strip a lone trailing quote,
+    # which would break LIKE '%Name%' and cause SQL error 42000.
+    sql = re.sub(r'["\']\}\s*$', "", sql).strip()
     sql = re.sub(r"\}\s*$", "", sql).strip()
     return sql.rstrip(";").strip()
 
@@ -829,6 +829,14 @@ def repair_select_query(sql):
     upper = sql.upper()
     if upper.startswith("SELECT") or upper.startswith("WITH") or upper.startswith("("):
         return _strip_sql_wrapper_noise(sql)
+
+    # Inline DECLARE @x = expr first so SELECT does not keep undeclared @vars.
+    if re.search(r"\bDECLARE\b", sql, re.IGNORECASE):
+        sql = expand_declare_variables(sql)
+        sql = _strip_sql_wrapper_noise(sql)
+        upper = sql.upper()
+        if upper.startswith("SELECT") or upper.startswith("WITH") or upper.startswith("("):
+            return sql
 
     # Drop leading DECLARE @x = ... before a SELECT (keep the SELECT only).
     declare_select = re.search(
@@ -861,6 +869,190 @@ def repair_select_query(sql):
     return sql
 
 
+def _split_sql_comma_args(text):
+    """Split on commas that are outside parentheses and string literals."""
+    parts = []
+    buf = []
+    depth = 0
+    in_quote = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if in_quote:
+            buf.append(ch)
+            if ch == "'" and i + 1 < len(text) and text[i + 1] == "'":
+                buf.append(text[i + 1])
+                i += 2
+                continue
+            if ch == "'":
+                in_quote = False
+            i += 1
+            continue
+        if ch == "'":
+            in_quote = True
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "(":
+            depth += 1
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == ")":
+            depth = max(0, depth - 1)
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "," and depth == 0:
+            piece = "".join(buf).strip()
+            if piece:
+                parts.append(piece)
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    piece = "".join(buf).strip()
+    if piece:
+        parts.append(piece)
+    return parts
+
+
+def expand_declare_variables(sql):
+    """
+    Inline DECLARE @var = expr so we do not leave undeclared @variables
+    after stripping DECLARE (a common 42000 failure).
+    """
+    if not sql or not re.search(r"\bDECLARE\b", sql, re.IGNORECASE):
+        return sql
+
+    assignments = {}
+
+    def collect_declare(match):
+        body = match.group(1).strip().rstrip(";")
+        for part in _split_sql_comma_args(body):
+            assign = re.match(
+                r"(@\w+)\s+(?:AS\s+)?[A-Za-z][A-Za-z0-9_\(\)\s]*?\s*=\s*(.+)$",
+                part,
+                re.IGNORECASE | re.DOTALL,
+            )
+            if assign:
+                assignments[assign.group(1)] = assign.group(2).strip().rstrip(";")
+        return " "
+
+    sql = re.sub(
+        r"\bDECLARE\b\s+((?:(?!\bSELECT\b|\bWITH\b|\bSET\b).)+)",
+        collect_declare,
+        sql,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    for var, expr in assignments.items():
+        sql = re.sub(rf"(?<!\w){re.escape(var)}\b", f"({expr})", sql)
+
+    return sql.strip()
+
+
+def fix_datavista_schema(sql):
+    """Rewrite common wrong table/column names the model invents for DataVista."""
+    if not sql:
+        return sql
+
+    table_aliases = {
+        "cr_submitmaster": "CR_SubmittalMaster",
+        "cr_submittals": "CR_SubmittalMaster",
+        "cr_submissionmaster": "CR_SubmittalMaster",
+        "submittalmaster": "CR_SubmittalMaster",
+        "submittals": "CR_SubmittalMaster",
+        "submissions": "CR_SubmittalMaster",
+        "cr_hire": "CR_HireMaster",
+        "cr_hires": "CR_HireMaster",
+        "hiremaster": "CR_HireMaster",
+        "cr_interview": "CR_InterviewMaster",
+        "interviewmaster": "CR_InterviewMaster",
+        "cr_reject": "CR_RejectMaster",
+        "rejectmaster": "CR_RejectMaster",
+    }
+    for wrong, right in table_aliases.items():
+        sql = re.sub(
+            rf"(?<![\w.\]])\[?{wrong}\]?\b",
+            right,
+            sql,
+            flags=re.IGNORECASE,
+        )
+
+    columns = {
+        "submitdate": "SUBMITTALDATE",
+        "submit_date": "SUBMITTALDATE",
+        "submissiondate": "SUBMITTALDATE",
+        "submission_date": "SUBMITTALDATE",
+        "submittal_date": "SUBMITTALDATE",
+        "submitteddate": "SUBMITTALDATE",
+        "submitted_date": "SUBMITTALDATE",
+        "recruitername": "PRIMARYRECRUITERNAME",
+        "recruiter_name": "PRIMARYRECRUITERNAME",
+        "primaryrecruiter": "PRIMARYRECRUITERNAME",
+        "primary_recruiter": "PRIMARYRECRUITERNAME",
+        "primary_recruiter_name": "PRIMARYRECRUITERNAME",
+        "interview_date": "INTERVIEWDATE",
+        "hiredate": "PLACEMENTDATE",
+        "hire_date": "PLACEMENTDATE",
+        "offerdate": "PLACEMENTDATE",
+        "offer_date": "PLACEMENTDATE",
+        "placement_date": "PLACEMENTDATE",
+        "start_date": "STARTDATE",
+        "payrate": "AGREEDPAYRATE",
+        "pay_rate": "AGREEDPAYRATE",
+        "agreed_pay_rate": "AGREEDPAYRATE",
+        "billrate": "AGREEDBILLRATE",
+        "bill_rate": "AGREEDBILLRATE",
+        "company_name": "COMPANYNAME",
+        "job_title": "JOBTITLE",
+        "reject_reason": "REJECTREASON",
+    }
+    for wrong, right in columns.items():
+        sql = re.sub(rf"\b{wrong}\b", right, sql, flags=re.IGNORECASE)
+
+    # Dates are NVARCHAR — YEAR/MONTH/DAY need TRY_CONVERT first.
+    date_cols = (
+        "SUBMITTALDATE",
+        "INTERVIEWDATE",
+        "PLACEMENTDATE",
+        "STARTDATE",
+        "INTERNALREJECTDATE",
+        "EXTERNALREJECTDATE",
+    )
+    for col in date_cols:
+        sql = re.sub(
+            rf"\b(YEAR|MONTH|DAY)\s*\(\s*\[?{col}\]?\s*\)",
+            rf"\1(TRY_CONVERT(date, {col}))",
+            sql,
+            flags=re.IGNORECASE,
+        )
+        # Bare date comparisons: SUBMITTALDATE >= '2026-07-01'
+        # Skip when already wrapped in TRY_CONVERT(date, ...).
+        sql = re.sub(
+            rf"(?<!TRY_CONVERT\(date, )(?<![\w.])\[?{col}\]?\s*(=|<>|!=|>=|<=|>|<)\s*",
+            lambda m, c=col: f"TRY_CONVERT(date, {c}) {m.group(1)} ",
+            sql,
+            flags=re.IGNORECASE,
+        )
+        sql = re.sub(
+            rf"(?<!TRY_CONVERT\(date, )(?<![\w.])\[?{col}\]?\s+BETWEEN\b",
+            f"TRY_CONVERT(date, {col}) BETWEEN",
+            sql,
+            flags=re.IGNORECASE,
+        )
+
+    sql = re.sub(
+        r"TRY_CONVERT\s*\(\s*date\s*,\s*TRY_CONVERT\s*\(\s*date\s*,\s*([A-Za-z0-9_]+)\s*\)\s*\)",
+        r"TRY_CONVERT(date, \1)",
+        sql,
+        flags=re.IGNORECASE,
+    )
+    return sql
+
+
 def clean_sql(sql, actual_table_name="EmployeeAttendance"):
     if not sql or not sql.strip():
         return "NA"
@@ -874,9 +1066,11 @@ def clean_sql(sql, actual_table_name="EmployeeAttendance"):
         .strip()
         .rstrip(";")
     )
+    sql = expand_declare_variables(sql)
     sql = repair_select_query(sql)
     sql = normalize_readonly_sql(sql)
     sql = fix_username_prefix_match(fix_workforce_schema(sql, actual_table_name))
+    sql = fix_datavista_schema(sql)
     sql = qualify_datavista_sql(sql)
     sql = convert_limit_to_top(sql)
     sql = ensure_single_readonly_sql(sql)
@@ -1611,10 +1805,10 @@ def find_matching_candidates(name_hints, limit=20):
                     "("
                     f"CANDIDATEFIRSTNAME LIKE '%{prefix}%' "
                     f"OR CANDIDATELASTNAME LIKE '%{prefix}%' "
-                    f"OR DIFFERENCE(CANDIDATEFIRSTNAME, '{safe}') >= 3 "
-                    f"OR DIFFERENCE(CANDIDATELASTNAME, '{safe}') >= 3 "
-                    f"OR SOUNDEX(CANDIDATEFIRSTNAME) = SOUNDEX('{safe}') "
-                    f"OR SOUNDEX(CANDIDATELASTNAME) = SOUNDEX('{safe}')"
+                    f"OR DIFFERENCE(CAST(CANDIDATEFIRSTNAME AS NVARCHAR(400)), '{safe}') >= 3 "
+                    f"OR DIFFERENCE(CAST(CANDIDATELASTNAME AS NVARCHAR(400)), '{safe}') >= 3 "
+                    f"OR SOUNDEX(CAST(CANDIDATEFIRSTNAME AS NVARCHAR(400))) = SOUNDEX('{safe}') "
+                    f"OR SOUNDEX(CAST(CANDIDATELASTNAME AS NVARCHAR(400))) = SOUNDEX('{safe}')"
                     ")"
                 )
             fuzzy_selects.append(
@@ -1719,9 +1913,9 @@ def find_matching_recruiters(name_hints, limit=20):
                     f"PRIMARYRECRUITERNAME LIKE '%{prefix}%' "
                     f"OR USERFIRSTNAME LIKE '%{prefix}%' "
                     f"OR USERLASTNAME LIKE '%{prefix}%' "
-                    f"OR DIFFERENCE(PRIMARYRECRUITERNAME, '{safe}') >= 3 "
-                    f"OR DIFFERENCE(USERFIRSTNAME, '{safe}') >= 3 "
-                    f"OR DIFFERENCE(USERLASTNAME, '{safe}') >= 3"
+                    f"OR DIFFERENCE(CAST(PRIMARYRECRUITERNAME AS NVARCHAR(400)), '{safe}') >= 3 "
+                    f"OR DIFFERENCE(CAST(USERFIRSTNAME AS NVARCHAR(400)), '{safe}') >= 3 "
+                    f"OR DIFFERENCE(CAST(USERLASTNAME AS NVARCHAR(400)), '{safe}') >= 3"
                     ")"
                 )
             fuzzy_selects.append(
@@ -2410,6 +2604,7 @@ def ask_question():
             }
         )
 
+    sql_query = ""
     try:
         history = add_result_context_to_history(history, last_result)
         primary_table = schema_provider.get_primary_table_name()
@@ -2567,13 +2762,23 @@ def ask_question():
             }
         )
     except DATABASE_ERROR_TYPES as exc:
+        detail = str(exc)
+        hint = (
+            "Common DataVista fixes: use SUBMITTALDATE (not SubmitDate), "
+            "PRIMARYRECRUITERNAME, and TRY_CONVERT(date, ...) for month filters. "
+            "Also confirm the SQL login can read the DataVista database."
+        )
         return jsonify(
             {
+                "query": sql_query,
                 "answer": (
                     "I couldn't run the database query. The table or column name may be wrong "
-                    "for your connected SQL Server database."
+                    "for your connected SQL Server database.\n\n"
+                    f"{hint}"
                 ),
-                "error": str(exc),
+                "error": detail,
+                "data": [],
+                "chart_type": "table",
             }
         )
     except Exception as exc:
