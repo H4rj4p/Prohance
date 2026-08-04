@@ -86,7 +86,5 @@ ORDER BY Stage;
 - Return only needed columns.
 - For aggregates (count, average, total), use COUNT/AVG/SUM and GROUP BY when needed.
 
-## Response / SQL rules
-- Return ONLY one read-only SELECT or WITH ... SELECT.
-- No markdown, no explanation, no USE/SET/INSERT/UPDATE/DELETE.
-- Prefer TOP when listing many rows unless the user asks for everyone.
+If a person name does not match after allowing small spelling differences (1-2 letters),
+do not invent people. The app will say it could not find that person and ask to check spelling.

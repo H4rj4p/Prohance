@@ -482,8 +482,8 @@ def datavista_table_guidance(question):
         )
 
     return (
-        "TABLE RULE: Choose the CR_* table from the question. "
-        "If unsure which stage, UNION ALL the four CR_* tables with a Stage column."
+        "TABLE RULE: If the pipeline stage is unclear, search ALL four CR_* tables "
+        "with UNION ALL and a Stage column. Do not guess only CR_HireMaster."
     )
 
 
@@ -1115,6 +1115,124 @@ def extract_name_hints(question):
     return hints
 
 
+def levenshtein_distance(left, right):
+    a = (left or "").lower()
+    b = (right or "").lower()
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, start=1):
+        curr = [i]
+        for j, cb in enumerate(b, start=1):
+            ins = curr[j - 1] + 1
+            delete = prev[j] + 1
+            sub = prev[j - 1] + (ca != cb)
+            curr.append(min(ins, delete, sub))
+        prev = curr
+    return prev[-1]
+
+
+def score_name_match(hints, full_name):
+    """Lower is better. None means not close enough (more than ~2 letter mistakes)."""
+    name = " ".join(str(full_name or "").split())
+    if not name or not hints:
+        return None
+
+    name_l = name.lower()
+    tokens = [t for t in re.split(r"[^a-z0-9]+", name_l) if t]
+    total = 0
+
+    for hint in hints:
+        h = hint.lower()
+        if h in name_l:
+            total += 0
+            continue
+        distances = [levenshtein_distance(h, token) for token in tokens] or [99]
+        best = min(distances)
+        # Allow 1-2 character typos on a token of similar length.
+        if best <= 2 and any(abs(len(h) - len(token)) <= 2 for token in tokens):
+            total += best
+            continue
+        return None
+
+    return total
+
+
+def finalize_name_matches(matches, hints, max_confirm=3):
+    """
+    Decide whether to auto-resolve, ask Did you mean (max 3), or report not found.
+    Returns (username, id, confirm_matches, status)
+    status: resolved | confirm | not_found | ambiguous
+    """
+    if not matches:
+        return None, None, [], "not_found"
+
+    scored = []
+    for match in matches:
+        score = score_name_match(hints, match.get("username"))
+        if score is None:
+            continue
+        scored.append((score, match))
+
+    if not scored:
+        return None, None, [], "not_found"
+
+    scored.sort(key=lambda item: (item[0], str(item[1].get("username") or "").lower()))
+    best_score = scored[0][0]
+    best_matches = [match for score, match in scored if score == best_score]
+
+    # Unique clear winner (exact/near-exact, or clearly better than the rest).
+    if len(best_matches) == 1:
+        if len(scored) == 1 or scored[1][0] > best_score:
+            match = best_matches[0]
+            employee_id = match.get("employee_id")
+            return (
+                match.get("username"),
+                str(employee_id) if employee_id is not None else None,
+                [],
+                "resolved",
+            )
+
+    if 2 <= len(best_matches) <= max_confirm and best_score <= 2:
+        return None, None, best_matches[:max_confirm], "confirm"
+
+    if len(best_matches) > max_confirm:
+        return None, None, [], "ambiguous"
+
+    # Fall back to the single closest name if it's within 2 edits.
+    if best_score <= 2:
+        match = scored[0][1]
+        employee_id = match.get("employee_id")
+        return (
+            match.get("username"),
+            str(employee_id) if employee_id is not None else None,
+            [],
+            "resolved",
+        )
+
+    return None, None, [], "not_found"
+
+
+def person_not_found_message(question):
+    hint_text = " ".join(extract_name_hints(question)) or "that person"
+    return (
+        f'I couldn\'t find anything about "{hint_text}". '
+        "Could you double-check the spelling, or try the full first and last name?"
+    )
+
+
+def person_ambiguous_message(question):
+    hint_text = " ".join(extract_name_hints(question)) or "that name"
+    return (
+        f'I found several people that look similar to "{hint_text}". '
+        "Please use the full first and last name so I can narrow it down."
+    )
+
+
 def find_matching_employees(table_name, name_hints, limit=20):
     """Match employees by first name, last name, or both against userName."""
     if not table_name or not name_hints:
@@ -1141,15 +1259,31 @@ def find_matching_employees(table_name, name_hints, limit=20):
     try:
         rows = execute_sql(sql)
     except Exception:
-        sql = f"""
-            SELECT DISTINCT TOP ({int(limit)})
-                userName AS username
+        rows = []
+
+    if not rows:
+        # Fuzzy fallback: names that sound like / start like the hint.
+        fuzzy_parts = []
+        for hint in name_hints:
+            safe = sql_literal(hint)
+            prefix = sql_literal(hint[: max(2, min(3, len(hint)))])
+            fuzzy_parts.append(
+                "("
+                f"userName LIKE '%{prefix}%' "
+                f"OR DIFFERENCE(userName, '{safe}') >= 3 "
+                f"OR SOUNDEX(userName) = SOUNDEX('{safe}')"
+                ")"
+            )
+        fuzzy_sql = f"""
+            SELECT DISTINCT TOP (80)
+                userName AS username,
+                employeeid AS employee_id
             FROM [{table_name}]
-            WHERE {where_sql}
-            ORDER BY userName
+            WHERE {" AND ".join(fuzzy_parts)}
+            ORDER BY userName, employeeid
         """
         try:
-            rows = execute_sql(sql)
+            rows = execute_sql(fuzzy_sql)
         except Exception:
             return []
 
@@ -1170,33 +1304,21 @@ def find_matching_employees(table_name, name_hints, limit=20):
 
 def resolve_employee_from_question(question, table_name, confirmed_username, confirmed_employee_id):
     """
-    Resolve a person mentioned by first name, last name, or both.
-    Returns (confirmed_username, confirmed_employee_id, candidates_needing_confirmation).
+    Resolve a Prohance employee by first/last name.
+    Returns (username, id, confirm_matches, status).
     """
     if confirmed_employee_id or confirmed_username:
-        return confirmed_username, confirmed_employee_id, []
+        return confirmed_username, confirmed_employee_id, [], "resolved"
 
     hints = extract_name_hints(question)
     if not hints:
-        return None, None, []
+        return None, None, [], "none"
 
     matches = find_matching_employees(table_name, hints)
     if not matches and len(hints) > 1:
         matches = find_matching_employees(table_name, [hints[0]])
 
-    if len(matches) == 1:
-        match = matches[0]
-        employee_id = match.get("employee_id")
-        return (
-            match.get("username"),
-            str(employee_id) if employee_id is not None else None,
-            [],
-        )
-
-    if len(matches) > 1:
-        return None, None, matches
-
-    return None, None, []
+    return finalize_name_matches(matches, hints)
 
 
 def _candidate_name_where(name_hints):
@@ -1245,7 +1367,47 @@ def find_matching_candidates(name_hints, limit=20):
     try:
         rows = execute_sql(sql)
     except Exception:
-        return []
+        rows = []
+
+    if not rows:
+        fuzzy_selects = []
+        for table in DATAVISTA_TABLES:
+            fuzzy_parts = []
+            for hint in name_hints:
+                safe = sql_literal(hint)
+                prefix = sql_literal(hint[: max(2, min(3, len(hint)))])
+                fuzzy_parts.append(
+                    "("
+                    f"CANDIDATEFIRSTNAME LIKE '%{prefix}%' "
+                    f"OR CANDIDATELASTNAME LIKE '%{prefix}%' "
+                    f"OR DIFFERENCE(CANDIDATEFIRSTNAME, '{safe}') >= 3 "
+                    f"OR DIFFERENCE(CANDIDATELASTNAME, '{safe}') >= 3 "
+                    f"OR SOUNDEX(CANDIDATEFIRSTNAME) = SOUNDEX('{safe}') "
+                    f"OR SOUNDEX(CANDIDATELASTNAME) = SOUNDEX('{safe}')"
+                    ")"
+                )
+            fuzzy_selects.append(
+                f"""
+                SELECT DISTINCT
+                    LTRIM(RTRIM(COALESCE(CANDIDATEFIRSTNAME, ''))) + ' ' +
+                    LTRIM(RTRIM(COALESCE(CANDIDATELASTNAME, ''))) AS username,
+                    CANDIDATEID AS employee_id
+                FROM [{db_name}].[dbo].[{table}]
+                WHERE {" AND ".join(fuzzy_parts)}
+                """
+            )
+        fuzzy_sql = f"""
+            SELECT DISTINCT TOP (80) username, employee_id
+            FROM (
+                {" UNION ALL ".join(fuzzy_selects)}
+            ) AS people
+            WHERE LTRIM(RTRIM(username)) <> ''
+            ORDER BY username, employee_id
+        """
+        try:
+            rows = execute_sql(fuzzy_sql)
+        except Exception:
+            return []
 
     seen = set()
     matches = []
@@ -1312,7 +1474,50 @@ def find_matching_recruiters(name_hints, limit=20):
     try:
         rows = execute_sql(sql)
     except Exception:
-        return []
+        rows = []
+
+    if not rows:
+        fuzzy_selects = []
+        for table in DATAVISTA_TABLES:
+            fuzzy_parts = []
+            for hint in name_hints:
+                safe = sql_literal(hint)
+                prefix = sql_literal(hint[: max(2, min(3, len(hint)))])
+                fuzzy_parts.append(
+                    "("
+                    f"PRIMARYRECRUITERNAME LIKE '%{prefix}%' "
+                    f"OR USERFIRSTNAME LIKE '%{prefix}%' "
+                    f"OR USERLASTNAME LIKE '%{prefix}%' "
+                    f"OR DIFFERENCE(PRIMARYRECRUITERNAME, '{safe}') >= 3 "
+                    f"OR DIFFERENCE(USERFIRSTNAME, '{safe}') >= 3 "
+                    f"OR DIFFERENCE(USERLASTNAME, '{safe}') >= 3"
+                    ")"
+                )
+            fuzzy_selects.append(
+                f"""
+                SELECT DISTINCT
+                    COALESCE(
+                        NULLIF(LTRIM(RTRIM(PRIMARYRECRUITERNAME)), ''),
+                        LTRIM(RTRIM(COALESCE(USERFIRSTNAME, ''))) + ' ' +
+                        LTRIM(RTRIM(COALESCE(USERLASTNAME, '')))
+                    ) AS username,
+                    userid AS employee_id
+                FROM [{db_name}].[dbo].[{table}]
+                WHERE {" AND ".join(fuzzy_parts)}
+                """
+            )
+        fuzzy_sql = f"""
+            SELECT DISTINCT TOP (80) username, employee_id
+            FROM (
+                {" UNION ALL ".join(fuzzy_selects)}
+            ) AS people
+            WHERE LTRIM(RTRIM(username)) <> ''
+            ORDER BY username, employee_id
+        """
+        try:
+            rows = execute_sql(fuzzy_sql)
+        except Exception:
+            return []
 
     seen = set()
     matches = []
@@ -1331,103 +1536,87 @@ def find_matching_recruiters(name_hints, limit=20):
 
 def resolve_candidate_from_question(question, confirmed_username, confirmed_employee_id):
     if confirmed_employee_id or confirmed_username:
-        return confirmed_username, confirmed_employee_id, []
+        return confirmed_username, confirmed_employee_id, [], "resolved"
 
     hints = extract_name_hints(question)
     if not hints:
-        return None, None, []
+        return None, None, [], "none"
 
     matches = find_matching_candidates(hints)
     if not matches and len(hints) > 1:
         matches = find_matching_candidates([hints[0]])
 
-    if len(matches) == 1:
-        match = matches[0]
-        employee_id = match.get("employee_id")
-        return (
-            match.get("username"),
-            str(employee_id) if employee_id is not None else None,
-            [],
-        )
-
-    if len(matches) > 1:
-        return None, None, matches
-
-    return None, None, []
+    return finalize_name_matches(matches, hints)
 
 
 def resolve_recruiter_from_question(question, confirmed_username, confirmed_employee_id):
     if confirmed_employee_id or confirmed_username:
-        return confirmed_username, confirmed_employee_id, []
+        return confirmed_username, confirmed_employee_id, [], "resolved"
 
     hints = extract_name_hints(question)
     if not hints:
-        return None, None, []
+        return None, None, [], "none"
 
     matches = find_matching_recruiters(hints)
     if not matches and len(hints) > 1:
         matches = find_matching_recruiters([hints[0]])
 
-    if len(matches) == 1:
-        match = matches[0]
-        employee_id = match.get("employee_id")
-        return (
-            match.get("username"),
-            str(employee_id) if employee_id is not None else None,
-            [],
-        )
-
-    if len(matches) > 1:
-        return None, None, matches
-
-    return None, None, []
+    return finalize_name_matches(matches, hints)
 
 
 def resolve_person_from_question(question, primary_table, confirmed_username, confirmed_employee_id):
     """
     Resolve a named person in Prohance (employees) or DataVista (candidates/recruiters).
-    Returns (username, id, matches, domain).
+    Returns (username, id, matches, domain, status).
     """
     domain = detect_question_domain(question)
 
     if domain == "datavista":
         if is_recruiter_question(question):
-            username, person_id, matches = resolve_recruiter_from_question(
+            username, person_id, matches, status = resolve_recruiter_from_question(
                 question, confirmed_username, confirmed_employee_id
             )
-            return username, person_id, matches, "datavista"
+            return username, person_id, matches, "datavista", status
 
-        username, person_id, matches = resolve_candidate_from_question(
+        username, person_id, matches, status = resolve_candidate_from_question(
             question, confirmed_username, confirmed_employee_id
         )
-        return username, person_id, matches, "datavista"
+        return username, person_id, matches, "datavista", status
 
-    username, person_id, matches = resolve_employee_from_question(
+    username, person_id, matches, status = resolve_employee_from_question(
         question, primary_table, confirmed_username, confirmed_employee_id
     )
-    if username or matches:
-        return username, person_id, matches, "prohance"
+    if status in {"resolved", "confirm", "ambiguous"}:
+        return username, person_id, matches, "prohance", status
 
     # Name mentioned but not found in Prohance — try DataVista candidates.
     if extract_name_hints(question) and not (confirmed_username or confirmed_employee_id):
-        username, person_id, matches = resolve_candidate_from_question(
+        username, person_id, matches, status = resolve_candidate_from_question(
             question, confirmed_username, confirmed_employee_id
         )
-        if username or matches:
-            return username, person_id, matches, "datavista"
+        if status != "none":
+            return username, person_id, matches, "datavista", status
 
-    return confirmed_username, confirmed_employee_id, [], "prohance"
+    return (
+        confirmed_username,
+        confirmed_employee_id,
+        [],
+        "prohance",
+        "not_found" if extract_name_hints(question) else "none",
+    )
 
 
 def should_confirm(candidates, question, confirmed_employee_id, confirmed_username=None):
+    # Prefer the pre-query resolver. Avoid large Did-you-mean lists after SQL runs.
     if confirmed_employee_id or confirmed_username:
         return False
-    if len(candidates) <= 1:
+    if not extract_name_hints(question):
         return False
     if COMPARISON_PATTERN.search(question or ""):
         return False
-    # Only ask when the question appears to name a person.
-    return bool(extract_name_hints(question))
+    if len(candidates) < 2 or len(candidates) > 3:
+        return False
+    return True
 
 
 def wants_chart(question):
@@ -1965,13 +2154,37 @@ def ask_question():
             confirmed_employee_id,
             name_matches,
             domain,
+            name_status,
         ) = resolve_person_from_question(
             question,
             primary_table,
             confirmed_username,
             confirmed_employee_id,
         )
-        if name_matches:
+
+        if name_status == "not_found":
+            return jsonify(
+                {
+                    "query": "",
+                    "answer": person_not_found_message(question),
+                    "data": [],
+                    "chart_type": "table",
+                    "domain": domain,
+                }
+            )
+
+        if name_status == "ambiguous":
+            return jsonify(
+                {
+                    "query": "",
+                    "answer": person_ambiguous_message(question),
+                    "data": [],
+                    "chart_type": "table",
+                    "domain": domain,
+                }
+            )
+
+        if name_matches and name_status == "confirm":
             hint_text = " ".join(extract_name_hints(question)) or "that name"
             person_word = (
                 "recruiters"
@@ -1984,11 +2197,11 @@ def ask_question():
                 {
                     "query": "",
                     "answer": (
-                        f'I found {len(name_matches)} {person_word} matching "{hint_text}". '
-                        "Which one did you mean?"
+                        f'I found {len(name_matches)} close matches for "{hint_text}". '
+                        "Did you mean one of these?"
                     ),
                     "needs_confirmation": True,
-                    "candidates": name_matches,
+                    "candidates": name_matches[:3],
                     "data": [],
                     "chart_type": "table",
                     "domain": domain,
@@ -2038,16 +2251,17 @@ def ask_question():
         candidates = get_candidates(results)
         if should_confirm(candidates, question, confirmed_employee_id, confirmed_username):
             hint_text = " ".join(extract_name_hints(question)) or "that name"
+            shortlist = candidates[:3]
             return jsonify(
                 {
                     "query": sql_query,
                     "answer": (
-                        f'I found {len(candidates)} people matching "{hint_text}". '
-                        "Which one did you mean?"
+                        f'I found {len(shortlist)} close matches for "{hint_text}". '
+                        "Did you mean one of these?"
                     ),
                     "needs_confirmation": True,
-                    "candidates": candidates,
-                    "data": results,
+                    "candidates": shortlist,
+                    "data": [],
                     "chart_type": "table",
                 }
             )
