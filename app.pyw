@@ -286,20 +286,23 @@ DATAVISTA_TABLES = (
 
 DATAVISTA_PATTERN = re.compile(
     r"\b("
-    r"datavista|hire[ds]?|hiring|interview(?:s|ed)?|reject(?:ion|ed|s)?|"
-    r"submittal(?:s)?|submitted|candidate(?:s)?|recruiter(?:s)?|"
-    r"recruit(?:s|ed|ing)?|placement(?:s)?|bill\s*rate|pay\s*rate|job\s*title|"
-    r"company\s*name|agreed\s*pay|cr_hire|cr_interview|cr_reject|cr_submittal|"
-    r"pipeline|recruiting"
+    r"datavista|hire[ds]?|hiring|offer(?:ed|s)?|interview(?:s|ed)?|"
+    r"reject(?:ion|ed|s)?|submittal(?:s)?|submitted|submit|submission(?:s)?|"
+    r"candidate(?:s)?|client(?:s)?|recruiter(?:s)?|recruit(?:s|ed|ing)?|"
+    r"placement(?:s)?|placement\s*date|hire\s*date|offer\s*date|start\s*date|"
+    r"bill\s*rate|pay\s*rate|agreed\s*pay|agreed\s*bill|job\s*title|"
+    r"company(?:\s*name)?|pipeline|recruiting|cr_hire|cr_interview|cr_reject|cr_submittal"
     r")\b",
     re.IGNORECASE,
 )
 
 PROHANCE_PATTERN = re.compile(
     r"\b("
-    r"prohance|logged\s*hours?|aafs|break(?:s)?|login|logout|session\s*date|"
-    r"attendance|shift(?:s)?|late\s*login|swipe|personal\s*time|lunch\s*break|"
-    r"workforce|employee\s*hours"
+    r"prohance|logged\s*hours?|hours?\s*logged|aafs|break(?:s)?|"
+    r"login|logout|first\s*login|last\s*logout|session\s*date|"
+    r"attendance|shift(?:s)?|late\s*login|early\s*logout|swipe|"
+    r"personal\s*time|lunch\s*break|short\s*break|workforce|"
+    r"employee\s*hours|time\s*tracked|time\s*tracking"
     r")\b",
     re.IGNORECASE,
 )
@@ -470,38 +473,74 @@ def is_recruiter_question(question):
 def datavista_table_guidance(question):
     text = (question or "").lower()
 
-    if is_recruiter_question(question):
+    if is_recruiter_question(question) or re.search(
+        r"\b(how\s+many\s+clients?|clients?\s+did|performance|placed|placements?\s+did)\b",
+        text,
+    ):
         return (
-            "TABLE RULE: This is a recruiter/user question. Treat the named person as the "
+            "DATABASE: DataVista (recruiting/performance). "
+            "This is a recruiter/user performance question. Treat the named person as the "
             "user/recruiter. Filter PRIMARYRECRUITERNAME / USERFIRSTNAME / USERLASTNAME / userid. "
-            "Return candidate names plus light info (job title, company, pay rate, location, date). "
-            "UNION ALL across CR_SubmittalMaster, CR_InterviewMaster, CR_HireMaster, and "
-            "CR_RejectMaster with a Stage column unless one stage is explicitly named."
+            "Return candidate/client results with light info "
+            "(candidate name, company, job title, pay rate, location, stage date). "
+            "If stage is unnamed, UNION ALL all four CR_* tables with a Stage column. "
+            "For client counts use COUNT(DISTINCT COMPANYNAME)."
+        )
+
+    if re.search(r"\b(placement\s*date|offer\s*date|hire\s*date|received\s+an\s+offer)\b", text):
+        return (
+            "DATABASE: DataVista. TABLE: CR_HireMaster only. "
+            "Use PLACEMENTDATE (date they received the offer / were placed). "
+            "Do not confuse with STARTDATE."
+        )
+
+    if re.search(
+        r"\b(start\s*date|started\s+work|first\s+day|came\s+in\s+for\s+work|start\s+work)\b",
+        text,
+    ):
+        return (
+            "DATABASE: DataVista. TABLE: CR_HireMaster only. "
+            "Use STARTDATE (date they started work). "
+            "Do not confuse with PLACEMENTDATE (offer/placement date)."
         )
 
     if re.search(r"\b(interview|interviewed|interviews)\b", text):
-        return "TABLE RULE: Use ONLY DataVista.dbo.CR_InterviewMaster."
+        return (
+            "DATABASE: DataVista. TABLE: CR_InterviewMaster only. "
+            "Use INTERVIEWDATE for interview timing."
+        )
+
     if re.search(r"\b(submittal|submitted|submit|submission)s?\b", text):
-        return "TABLE RULE: Use ONLY DataVista.dbo.CR_SubmittalMaster."
+        return (
+            "DATABASE: DataVista. TABLE: CR_SubmittalMaster only. "
+            "Use SUBMITTALDATE for when they were submitted."
+        )
+
     if re.search(r"\b(reject|rejected|rejection|rejects)\b", text):
-        return "TABLE RULE: Use ONLY DataVista.dbo.CR_RejectMaster."
-    if re.search(r"\b(hire[ds]?|hiring|placement|placements|start\s*date|bill\s*rate)\b", text):
-        return "TABLE RULE: Use ONLY DataVista.dbo.CR_HireMaster."
+        return (
+            "DATABASE: DataVista. TABLE: CR_RejectMaster only. "
+            "Use INTERNALREJECTDATE / EXTERNALREJECTDATE and REJECTREASON."
+        )
+
+    if re.search(r"\b(hire[ds]?|hiring|offer(?:ed|s)?|bill\s*rate)\b", text):
+        return (
+            "DATABASE: DataVista. TABLE: CR_HireMaster only. "
+            "PLACEMENTDATE = offer/placement date; STARTDATE = work start date."
+        )
 
     if re.search(
         r"\b(pay\s*rate|agreed\s*pay|company(?:\s*name)?|job\s*title|location)\b",
         text,
     ):
         return (
-            "TABLE RULE: Stage is ambiguous. Do NOT default to CR_HireMaster. "
-            "UNION ALL matching rows from CR_SubmittalMaster, CR_InterviewMaster, "
-            "CR_HireMaster, and CR_RejectMaster with a Stage column. "
-            "Return rows where the requested fields are present."
+            "DATABASE: DataVista. Stage unclear — do NOT default to CR_HireMaster. "
+            "UNION ALL CR_SubmittalMaster, CR_InterviewMaster, CR_HireMaster, CR_RejectMaster "
+            "with a Stage column. Return rows where requested fields are present."
         )
 
     return (
-        "TABLE RULE: If the pipeline stage is unclear, search ALL four CR_* tables "
-        "with UNION ALL and a Stage column. Do not guess only CR_HireMaster."
+        "DATABASE: DataVista. If pipeline stage is unclear, UNION ALL all four CR_* tables "
+        "with a Stage column. Remember: Prohance is only for attendance/logged hours/breaks."
     )
 
 
@@ -1730,7 +1769,7 @@ def should_confirm(candidates, question, confirmed_employee_id, confirmed_userna
     # Prefer the pre-query resolver. Avoid large Did-you-mean lists after SQL runs.
     if confirmed_employee_id or confirmed_username:
         return False
-    if not extract_name_hints(question):
+    if not looks_like_person_question(question):
         return False
     if COMPARISON_PATTERN.search(question or ""):
         return False
@@ -2016,10 +2055,16 @@ def generate_sql(
         samples_text = load_text_file("sample_queries_datavista.txt")
         table_rule = datavista_table_guidance(question)
         extra = (
-            f"\nUse three-part names with database [{db_name}], e.g. "
+            f"\nDATABASE ROUTING: DataVista = recruiting/performance "
+            f"(submittals/interviews/hires/rejects/clients). "
+            f"Prohance = attendance (logged hours/breaks/AAFS/login).\n"
+            f"Use three-part names with database [{db_name}], e.g. "
             f"[{db_name}].[dbo].[CR_HireMaster].\n"
             f"{table_rule}\n"
-            "Never default to CR_HireMaster when the question did not say hire/hired/placement."
+            "In CR_HireMaster: PLACEMENTDATE = offer/placement date; "
+            "STARTDATE = date they started work. Never swap them.\n"
+            "Never default to CR_HireMaster when the question did not say "
+            "hire/offer/placement/start date."
         )
     else:
         instructions_text = load_text_file("instructions.txt")
@@ -2032,6 +2077,10 @@ def generate_sql(
         )
         extra = (
             f"{table_hint}\n"
+            "DATABASE ROUTING: Prohance = attendance/time tracking "
+            "(logged hours, breaks, AAFS, login/logout, late login, swipe, shift). "
+            "DataVista = recruiting/performance "
+            "(submittals, interviews, hires, rejects, clients, placement/start dates).\n"
             "Duration columns like logged_hours and aafs* breaks are often VARCHAR 'HH:MM:SS'. "
             "Never COALESCE them with 0 or AVG them directly. Convert to seconds with "
             "DATEDIFF(SECOND, 0, TRY_CAST(... AS TIME)) before AVG/SUM/addition. "
