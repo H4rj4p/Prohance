@@ -5,20 +5,20 @@ Use DataVista when the question is about recruiters/users, candidates, clients/c
 submittals, interviews, hires/offers, rejects, and how many placements or clients someone got.
 
 ## When to use DataVista (NOT Prohance)
-Choose DataVista if the question mentions or means any of:
-- submittal / submitted / submission
+DataVista is the DEFAULT for recruiting/performance questions. Choose DataVista for:
+- submit / submits / submittal / submitted / submission
 - interview / interviewed
 - hire / hired / hiring / offer
 - reject / rejected / rejection / reject reason
 - placement date / offer date
-- start date (as job/work start after offer — NOT Prohance sessionDate)
-- candidate / client / company / job title / pay rate / bill rate
-- recruiter performance / who did X recruit / how many clients did X get
+- start date (job/work start after offer — NOT Prohance sessionDate)
+- candidate / client / company / job title / pay rate / bill rate / agreed pay rate
+- recruiter performance / who did X recruit / how many submits or clients did X get
 - pipeline / recruiting / placements
 
 Do NOT use DataVista for attendance questions such as:
 - logged hours, breaks, AAFS, login/logout, late login, swipe, shift attendance
-Those belong in **Prohance**.
+Those belong in **Prohance** only.
 
 ## Databases / table names
 DataVista is on the SAME SQL Server as Prohance. Always use three-part names:

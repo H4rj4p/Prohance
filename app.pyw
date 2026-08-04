@@ -286,23 +286,33 @@ DATAVISTA_TABLES = (
 
 DATAVISTA_PATTERN = re.compile(
     r"\b("
-    r"datavista|hire[ds]?|hiring|offer(?:ed|s)?|interview(?:s|ed)?|"
-    r"reject(?:ion|ed|s)?|submittal(?:s)?|submitted|submit|submission(?:s)?|"
+    r"datavista|"
+    r"hire[ds]?|hiring|offer(?:ed|s)?|interview(?:s|ed)?|"
+    r"reject(?:ion|ed|s)?|"
+    # submit / submits / submitted / submittal(s) / submission(s)
+    r"submit(?:s|ted|tal|tals)?|submission(?:s)?|"
     r"candidate(?:s)?|client(?:s)?|recruiter(?:s)?|recruit(?:s|ed|ing)?|"
     r"placement(?:s)?|placement\s*date|hire\s*date|offer\s*date|start\s*date|"
-    r"bill\s*rate|pay\s*rate|agreed\s*pay|agreed\s*bill|job\s*title|"
-    r"company(?:\s*name)?|pipeline|recruiting|cr_hire|cr_interview|cr_reject|cr_submittal"
+    r"bill\s*rate|pay\s*rate|agreed\s*pay(?:\s*rate)?|agreed\s*bill(?:\s*rate)?|"
+    r"job\s*title|company(?:\s*name)?|pipeline|recruiting|"
+    r"quickbooks|job\s*id|job\s*reference|division|"
+    r"cr_hire|cr_interview|cr_reject|cr_submittal"
     r")\b",
     re.IGNORECASE,
 )
 
+# Prohance = attendance / time only. Keep this narrow on purpose.
 PROHANCE_PATTERN = re.compile(
     r"\b("
-    r"prohance|logged\s*hours?|hours?\s*logged|aafs|break(?:s)?|"
+    r"prohance|"
+    r"logged\s*hours?|hours?\s*logged|hours?\s*worked|worked\s*hours?|"
+    r"total\s*hours?|average\s*hours?|avg\s*hours?|"
+    r"aafs|break(?:s)?|lunch\s*break|short\s*break|personal\s*time|"
     r"login|logout|first\s*login|last\s*logout|session\s*date|"
     r"attendance|shift(?:s)?|late\s*login|early\s*logout|swipe|"
-    r"personal\s*time|lunch\s*break|short\s*break|workforce|"
-    r"employee\s*hours|time\s*tracked|time\s*tracking"
+    r"workforce|employee\s*hours|time\s*tracked|time\s*tracking|"
+    r"time\s*at\s*(?:work|desk)|on\s*desk|away\s*from\s*system|"
+    r"how\s+long\s+(?:did|have)\b|were\s+they\s+late|clock\s*in|clock\s*out"
     r")\b",
     re.IGNORECASE,
 )
@@ -314,21 +324,32 @@ def get_datavista_database_name():
 
 
 def detect_question_domain(question):
+    """
+    Route questions to Prohance (attendance/time) or DataVista (recruiting).
+
+    Prohance is ONLY for logged hours, breaks, AAFS, login/logout, attendance.
+    Submits, pay rates, start/placement dates, clients, candidates → DataVista.
+    When unsure, prefer DataVista (not Prohance).
+    """
     text = question or ""
     has_datavista = bool(DATAVISTA_PATTERN.search(text))
     has_prohance = bool(PROHANCE_PATTERN.search(text))
 
+    # Explicit database names always win.
     if re.search(r"\bdatavista\b", text, re.IGNORECASE):
         return "datavista"
     if re.search(r"\bprohance\b", text, re.IGNORECASE):
         return "prohance"
-    if has_datavista and not has_prohance:
+
+    # Recruiting keywords win over attendance when both appear
+    # (e.g. "breaks between submits" is still a recruiting question).
+    if has_datavista:
         return "datavista"
-    if has_prohance and not has_datavista:
+    if has_prohance:
         return "prohance"
-    if has_datavista and has_prohance:
-        return "datavista"
-    return "prohance"
+
+    # Default: DataVista. Prohance only when attendance/time keywords are present.
+    return "datavista"
 
 
 def get_datavista_schema_text():
@@ -453,6 +474,7 @@ def is_multi_part(question):
 
 
 def is_recruiter_question(question):
+    """True when the named person is the recruiter/user, not the candidate."""
     text = question or ""
     return bool(
         re.search(
@@ -462,7 +484,17 @@ def is_recruiter_question(question):
             r"candidates?\s+(?:for|of|under)|"
             r"who\s+(?:all\s+)?(?:they|he|she)\s+recruit|"
             r"(?:for|by)\s+this\s+user|"
-            r"worked\s+on|their\s+candidates"
+            r"worked\s+on|their\s+candidates|"
+            # "how many submits/hires/clients did Jordan make/get"
+            r"how\s+many\s+"
+            r"(?:submits?|submittals?|submissions?|hires?|interviews?|rejects?|"
+            r"clients?|candidates?|placements?|offers?)"
+            r"\b.*\b(?:did|has|have|made|got|get)\b|"
+            # "submits Jordan made" / "submittals by Priya" / "hires for this user"
+            r"(?:submits?|submittals?|submissions?|hires?|interviews?|rejects?|"
+            r"placements?)\s+(?:did|for|by|from)\b|"
+            r"(?:did|made|got)\s+.+\s+"
+            r"(?:submit|submittal|hire|interview|place|recruit)"
             r")\b",
             text,
             re.IGNORECASE,
@@ -2014,24 +2046,19 @@ def resolve_person_from_question(question, primary_table, confirmed_username, co
         )
         return username, person_id, matches, "datavista", status
 
-    username, person_id, matches, status = resolve_employee_from_question(
-        question, primary_table, confirmed_username, confirmed_employee_id
-    )
-    if status in {"resolved", "confirm", "ambiguous"}:
+    # Attendance/time questions: resolve against Prohance employees.
+    if domain == "prohance":
+        username, person_id, matches, status = resolve_employee_from_question(
+            question, primary_table, confirmed_username, confirmed_employee_id
+        )
         return username, person_id, matches, "prohance", status
 
-    if extract_name_hints(question):
-        username, person_id, matches, status = resolve_candidate_from_question(
-            question, confirmed_username, confirmed_employee_id
-        )
-        if status != "none":
-            return username, person_id, matches, "datavista", status
-
+    # DataVista (default for non-attendance): recruiters/candidates already handled above.
     return (
         None,
         None,
         [],
-        "prohance",
+        "datavista",
         "not_found" if extract_name_hints(question) else "none",
     )
 
@@ -2759,6 +2786,7 @@ def ask_question():
                 "data": results,
                 "chart_type": chart_type,
                 "total_rows": len(results),
+                "domain": domain,
             }
         )
     except DATABASE_ERROR_TYPES as exc:

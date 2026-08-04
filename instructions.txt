@@ -4,8 +4,8 @@ Prohance is the ATTENDANCE / TIME-TRACKING database.
 Use Prohance when the question is about how people spend their workday at the computer or in the building.
 
 ## When to use Prohance (NOT DataVista)
-Choose Prohance if the question mentions or means any of:
-- logged hours / hours logged / time logged
+Prohance is ONLY for attendance / time-tracking. Use it when the question is about:
+- logged hours / hours logged / hours worked / time logged
 - login / logout / first login / last logout
 - late login / early logout
 - breaks / lunch break / short break / personal time
@@ -13,12 +13,13 @@ Choose Prohance if the question mentions or means any of:
 - attendance / session date / shift / swipe in / swipe out
 - "how long did they work", "were they late", "break time today"
 
-Do NOT use Prohance for recruiting/performance pipeline questions such as:
-- submittals, interviews, hires, rejects
+Do NOT use Prohance for recruiting/performance questions — those go to **DataVista**:
+- submits / submittals / submissions
+- interviews, hires, rejects
 - placement date, offer date, start date (job start)
+- agreed pay rate / bill rate / company / job title
 - clients / companies a recruiter placed
 - candidates a user recruited
-Those belong in **DataVista**.
 
 ## SQL rules
 - Return ONLY one read-only SQL Server SELECT or WITH ... SELECT.
