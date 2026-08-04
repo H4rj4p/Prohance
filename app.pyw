@@ -2141,6 +2141,34 @@ def test_sql_connection():
                 rows = rows_as_dicts(cursor)
                 row = rows[0] if rows else {}
 
+                datavista_db = get_datavista_database_name()
+                datavista_ok = False
+                datavista_error = None
+                datavista_tables = []
+                try:
+                    cursor.execute(
+                        f"""
+                        SELECT name
+                        FROM [{datavista_db}].sys.tables
+                        WHERE name IN (
+                            'CR_HireMaster', 'CR_InterviewMaster',
+                            'CR_RejectMaster', 'CR_SubmittalMaster'
+                        )
+                        ORDER BY name
+                        """
+                    )
+                    datavista_tables = [
+                        item.get("name") for item in rows_as_dicts(cursor) if item.get("name")
+                    ]
+                    datavista_ok = len(datavista_tables) > 0
+                    if not datavista_ok:
+                        datavista_error = (
+                            f"Connected to SQL Server, but no CR_* tables were found in [{datavista_db}]. "
+                            "Check the database name or permissions."
+                        )
+                except Exception as datavista_exc:
+                    datavista_error = str(datavista_exc)
+
         values = parse_connection_string(os.environ.get("SqlConnectionString", ""))
         return jsonify(
             {
@@ -2151,6 +2179,10 @@ def test_sql_connection():
                 or values.get("data source", ""),
                 "database": row.get("DatabaseName", ""),
                 "serverVersion": row.get("ServerVersion", ""),
+                "datavistaDatabase": get_datavista_database_name(),
+                "datavistaOk": datavista_ok,
+                "datavistaTables": datavista_tables,
+                "datavistaError": datavista_error,
             }
         )
     except Exception as exc:
