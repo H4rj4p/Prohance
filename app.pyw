@@ -491,9 +491,17 @@ NAME_STOPWORDS = {
     "db", "dtae", "dta", "teh", "wat", "wut",
     "monthly", "weekly", "yearly", "quarterly", "annually", "annual", "daily",
     "currently", "recently", "previous", "previously", "overall", "totaled",
-    "something", "anything", "nothing", "everything", "metric", "metrics",
-    "amount", "number", "count", "counts", "stats", "statistics", "report",
-    "summary", "breakdown", "trend", "trends", "compare", "comparison",
+    "metric", "metrics", "amount", "counts", "stats", "statistics",
+    "breakdown", "trend", "trends", "comparison",
+    "performance", "including", "include", "includes", "exclude", "excluding",
+    "excluded", "weekend", "weekends", "weekday", "weekdays",
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "mon", "tue", "tues", "wed", "thu", "thur", "thurs", "fri", "sat", "sun",
+    "offer", "offers", "offered", "start", "starts", "started", "starting",
+    "give", "gimme", "show", "me", "get", "got",
+    "by", "per", "each", "every", "across", "within", "without",
+    "more", "than", "less", "over", "under", "above", "below",
+    "nine", "ten", "eleven", "twelve",
 }
 
 
@@ -778,6 +786,40 @@ def enhance_for_sql(question):
             "(Jan 1 through Dec 31 of that year). Do not use a different year."
         )
 
+    month_note = month_breakdown_guidance(question)
+    if month_note:
+        notes.append(month_note)
+
+    exclude_note = exclusion_sql_guidance(question)
+    if exclude_note:
+        notes.append(exclude_note)
+
+    if is_continuation_followup(question):
+        notes.append(
+            "FOLLOW-UP: Keep all filters from the previous question "
+            "(person, date range, thresholds like > 9 hours, exclusions). "
+            "Only change what the user newly asked for (e.g. average instead of list, "
+            "or add an excluding-weekends filter)."
+        )
+
+    # Mixed recruiting + attendance performance questions.
+    if (
+        re.search(r"\bperformance\b", text, re.IGNORECASE)
+        or (
+            re.search(r"\b(submits?|submittals?|interviews?|offers?|starts?)\b", text, re.I)
+            and re.search(r"\b(logged\s*hours?|avg|average)\b", text, re.I)
+        )
+    ):
+        notes.append(
+            "PERFORMANCE / MIXED METRICS: Named person is the recruiter/user. "
+            "Return ONE SELECT with multiple scalar subqueries or columns: "
+            "submittal COUNT from CR_SubmittalMaster, interview COUNT from CR_InterviewMaster, "
+            "offers/hires COUNT from CR_HireMaster (PLACEMENTDATE), "
+            "starts COUNT from CR_HireMaster (STARTDATE in the month), "
+            "and avg logged hours as avg_seconds from the Prohance attendance table "
+            "matching the same person on userName. Use three-part names for DataVista."
+        )
+
     if not notes:
         return question
 
@@ -792,6 +834,11 @@ def enhance_for_answer(question):
         "(days/weeks/hours/minutes), not HH:MM:SS clock time. "
         "Lead with the person, the metric, and the time period."
     )
+    if month_breakdown_guidance(question):
+        base += (
+            " If the data is month-by-month, use month NAMES (January, February, ...) "
+            "and cover every month present in the data, not only the first few."
+        )
     if not is_multi_part(question):
         return (question or "") + base
 
@@ -1753,6 +1800,54 @@ def enrich_duration_results(results):
             }:
                 new_row["duration"] = readable
         enriched.append(new_row)
+    return enrich_month_name_results(enriched)
+
+
+_MONTH_NAMES = (
+    "",
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+)
+
+
+def enrich_month_name_results(results):
+    """Replace numeric month columns (1-12) with month names like January."""
+    if not results:
+        return results
+
+    enriched = []
+    for row in results:
+        new_row = dict(row)
+        for key, value in list(row.items()):
+            key_l = re.sub(r"[^a-z0-9]+", "", (key or "").lower())
+            if key_l not in {
+                "month",
+                "monthnum",
+                "monthnumber",
+                "monthno",
+                "mon",
+                "monthofyear",
+            }:
+                continue
+            try:
+                month_num = int(float(value))
+            except (TypeError, ValueError):
+                continue
+            if 1 <= month_num <= 12:
+                new_row[key] = _MONTH_NAMES[month_num]
+                # Keep sort helper if useful for charts.
+                new_row.setdefault("month_num", month_num)
+        enriched.append(new_row)
     return enriched
 
 
@@ -1895,6 +1990,8 @@ def extract_name_hints(question):
     text = re.sub(r"[`\"“”]", " ", text)
     # what's / who's → remove so they never become names
     text = re.sub(r"\b(what|who|where|how|that|there|here)['’]s\b", r"\1", text, flags=re.I)
+    # "Samantha's performance" → keep "Samantha", drop possessive
+    text = re.sub(r"['’]s\b", " ", text, flags=re.IGNORECASE)
     text = re.sub(r"['’]", "", text)
 
     def clean_name_parts(raw):
@@ -1916,6 +2013,8 @@ def extract_name_hints(question):
         return parts
 
     patterned = [
+        # "Give me Disha Samantha's July performance..."
+        rf"^\s*(?:give\s+me|show\s+me|get\s+me|tell\s+me)\s+{_NAME_SPAN}\b",
         # "Akshay Soni, how many hours..." / "Akshay Soni: show logged hours"
         rf"^\s*{_NAME_SPAN}\s*[,:\-]\s*"
         rf"(?:how|what|when|who|where|show|list|give|tell|did|does|can|could|"
@@ -1927,7 +2026,10 @@ def extract_name_hints(question):
         rf"^\s*{_NAME_SPAN}\s+"
         rf"(?:how\s+many\s+)?"
         rf"(?:submits?|submittals?|submissions?|hires?|interviews?|rejects?|"
-        rf"clients?|placements?|offers?|hours?|breaks?)\b",
+        rf"clients?|placements?|offers?|hours?|breaks?|performance)\b",
+        # "Disha Samantha July month performance" / "Disha's July performance"
+        rf"\b{_NAME_SPAN}\s+"
+        rf"(?:{_NAME_MONTHS}|performance|month)\b",
         # role markers — name is the next word(s)
         rf"\b(?:candidate|employee|recruiter|user)(?:'s)?\s+{_NAME_SPAN}\b",
         # "for candidate Akshay Soni" / "for employee John"
@@ -1945,12 +2047,12 @@ def extract_name_hints(question):
         rf"\bfor\s+(?!{_NAME_MONTHS}\b){_NAME_SPAN}"
         rf"(?=\s+(?:how|what|when|who|did|does|do|has|have|had|was|is|are|"
         rf"{_NAME_TAIL_VERBS}|the|his|her|their|a|an|on|in|at|to|of|"
-        rf"this|last|next|,|\?|$))",
+        rf"this|last|next|performance|,|\?|$))",
         rf"\b(?:about|regarding)\s+{_NAME_SPAN}\b",
-        # "Akshay's logged hours" / "Jordan's submittal"
-        rf"\b{_NAME_SPAN}(?:'s)?\s+"
+        # "Akshay's logged hours" / "Jordan's submittal" / "Disha's performance"
+        rf"\b{_NAME_SPAN}\s+"
         rf"(?:interview|submittal|submission|hire|pay\s*rate|logged|log|"
-        rf"break|hours|submits?)\b",
+        rf"break|hours|submits?|performance|july|june|month)\b",
     ]
 
     for pattern in patterned:
@@ -2862,6 +2964,103 @@ def has_pronoun_person_followup(question):
     )
 
 
+def is_continuation_followup(question):
+    """
+    Follow-ups that should keep prior filters/SQL context:
+    "and avg logged hours", "excluding weekends", "what about this month".
+    """
+    text = (question or "").strip()
+    if not text:
+        return False
+    if is_comparison_question(text) or has_pronoun_person_followup(text):
+        return True
+    if re.match(
+        r"^\s*(and|also|plus|what\s+about|how\s+about|excluding|exclude)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return True
+    # Metric-only follow-up with no new person name.
+    if not extract_name_hints(text) and re.search(
+        r"\b(avg|average|total|sum|excluding|exclude|weekend|weekday|"
+        r"logged\s*hours?|month\s+by\s+month|by\s+month)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return True
+    return False
+
+
+def exclusion_sql_guidance(question):
+    """Translate excluding weekends/weekdays/Monday into SQL DATENAME filters."""
+    text = (question or "").lower()
+    if not re.search(r"\b(exclud(?:e|ing|ed)|without|except)\b", text):
+        return None
+
+    notes = [
+        "EXCLUSION FILTER: Use DATENAME(WEEKDAY, <date_column>) for day-of-week filters "
+        "(do not use DATEPART weekday numbers — they depend on DATEFIRST and are wrong)."
+    ]
+    if re.search(r"\bweekends?\b", text):
+        notes.append(
+            "Exclude weekends: AND DATENAME(WEEKDAY, <date>) NOT IN ('Saturday', 'Sunday')."
+        )
+    if re.search(r"\bweekdays?\b", text):
+        notes.append(
+            "Exclude weekdays: AND DATENAME(WEEKDAY, <date>) IN ('Saturday', 'Sunday')."
+        )
+
+    day_map = {
+        "monday": "Monday",
+        "tuesday": "Tuesday",
+        "wednesday": "Wednesday",
+        "thursday": "Thursday",
+        "friday": "Friday",
+        "saturday": "Saturday",
+        "sunday": "Sunday",
+        "mon": "Monday",
+        "tue": "Tuesday",
+        "tues": "Tuesday",
+        "wed": "Wednesday",
+        "thu": "Thursday",
+        "thur": "Thursday",
+        "thurs": "Thursday",
+        "fri": "Friday",
+        "sat": "Saturday",
+        "sun": "Sunday",
+    }
+    excluded_days = []
+    for key, label in day_map.items():
+        if re.search(rf"\b{key}s?\b", text):
+            if label not in excluded_days:
+                excluded_days.append(label)
+    if excluded_days:
+        listed = ", ".join(f"'{d}'" for d in excluded_days)
+        notes.append(
+            f"Exclude named weekdays: AND DATENAME(WEEKDAY, <date>) NOT IN ({listed})."
+        )
+    return " ".join(notes)
+
+
+def month_breakdown_guidance(question):
+    text = question or ""
+    if not re.search(
+        r"\b(month\s*by\s*month|by\s+month|each\s+month|monthly\s+breakdown|"
+        r"per\s+month|months?\s+this\s+year)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return None
+    return (
+        "MONTH BREAKDOWN: Return one row per calendar month. "
+        "Select DATENAME(month, <date>) AS month_name and MONTH(<date>) AS month_num, "
+        "GROUP BY DATENAME(month, <date>), MONTH(<date>), YEAR(<date>) "
+        "ORDER BY YEAR(<date>), MONTH(<date>). "
+        "Never return only MONTH(<date>) as the display month — users need January/February, "
+        "not 1/2/3. month_num is only for sorting."
+    )
+
+
 def names_refer_to_same_person(hints, full_name):
     if not hints or not full_name:
         return False
@@ -2897,11 +3096,15 @@ def should_reuse_prior_person(question, confirmed_username=None, confirmed_emplo
 def sanitize_history_for_question(question, history):
     """
     Avoid carrying the previous person's SQL filters into a new-person question.
-    Keep full history only for comparisons or pronoun follow-ups.
+    Keep full history for comparisons, pronoun follow-ups, and metric continuations.
     """
     if not history:
         return []
-    if is_comparison_question(question) or has_pronoun_person_followup(question):
+    if (
+        is_comparison_question(question)
+        or has_pronoun_person_followup(question)
+        or is_continuation_followup(question)
+    ):
         return history
 
     hints = extract_name_hints(question)
@@ -2932,6 +3135,8 @@ def should_attach_last_result(question, last_result):
     if is_comparison_question(question):
         return True
     if has_pronoun_person_followup(question):
+        return True
+    if is_continuation_followup(question):
         return True
     # New named person → do not inject previous result context.
     if extract_name_hints(question):

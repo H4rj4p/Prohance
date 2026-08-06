@@ -1052,9 +1052,10 @@
 
     function looksLikeNewPersonQuestion(text) {
       // If the user names someone (capitalized token or leading name),
-      // do not attach the previous person's result context unless comparing.
+      // do not attach the previous person's result context unless comparing / continuing.
       const q = String(text || "");
       if (/\b(compare|versus|vs\.?|both|difference between)\b/i.test(q)) return false;
+      if (/^\s*(and|also|plus|what about|how about|excluding|exclude)\b/i.test(q)) return false;
       if (/\b(he|she|they|them|his|her|their|him|this user|same person)\b/i.test(q)) {
         return false;
       }
@@ -1063,6 +1064,7 @@
         return true;
       }
       if (/\b(for|did|about)\s+[A-Z][a-zA-Z'.-]+/.test(q)) return true;
+      if (/^\s*(give|show|get|tell)\s+me\s+[A-Z][a-zA-Z'.-]+/i.test(q)) return true;
       return false;
     }
 

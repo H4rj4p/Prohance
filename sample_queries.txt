@@ -75,3 +75,28 @@ WHERE sessionDate >= DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1)
   AND sessionDate < DATEADD(month, 1, DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1))
 GROUP BY userName
 ORDER BY avg_seconds DESC;
+
+-- Logged hours over 9 hours, excluding weekends
+SELECT
+  userName,
+  sessionDate,
+  logged_hours,
+  COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(logged_hours)), '') AS TIME)), 0) AS logged_seconds
+FROM EmployeeAttendance
+WHERE sessionDate >= DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1)
+  AND COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(logged_hours)), '') AS TIME)), 0) > 9 * 3600
+  AND DATENAME(WEEKDAY, sessionDate) NOT IN ('Saturday', 'Sunday')
+ORDER BY sessionDate DESC;
+
+-- Average logged hours with same filters (follow-up style)
+SELECT
+  userName,
+  CAST(ROUND(AVG(
+    COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(logged_hours)), '') AS TIME)), 0)
+  ), 0) AS int) AS avg_seconds,
+  COUNT(*) AS session_count
+FROM EmployeeAttendance
+WHERE sessionDate >= DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1)
+  AND COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(logged_hours)), '') AS TIME)), 0) > 9 * 3600
+  AND DATENAME(WEEKDAY, sessionDate) NOT IN ('Saturday', 'Sunday')
+GROUP BY userName;

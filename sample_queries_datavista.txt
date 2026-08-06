@@ -73,6 +73,24 @@ WHERE NULLIF(LTRIM(RTRIM(COMPANYNAME)), '') IS NOT NULL
    OR NULLIF(LTRIM(RTRIM(AGREEDPAYRATE)), '') IS NOT NULL
 ORDER BY Stage;
 
+-- Month-by-month submittals this year (use month NAMES, not 1/2/3)
+SELECT
+  DATENAME(month, TRY_CONVERT(date, SUBMITTALDATE)) AS month_name,
+  MONTH(TRY_CONVERT(date, SUBMITTALDATE)) AS month_num,
+  COUNT(*) AS submittal_count
+FROM DataVista.dbo.CR_SubmittalMaster
+WHERE TRY_CONVERT(date, SUBMITTALDATE) >= DATEFROMPARTS(YEAR(GETDATE()), 1, 1)
+  AND TRY_CONVERT(date, SUBMITTALDATE) < DATEFROMPARTS(YEAR(GETDATE()) + 1, 1, 1)
+  AND (
+    PRIMARYRECRUITERNAME LIKE 'Disha%'
+    OR USERFIRSTNAME = 'Disha'
+  )
+GROUP BY
+  DATENAME(month, TRY_CONVERT(date, SUBMITTALDATE)),
+  MONTH(TRY_CONVERT(date, SUBMITTALDATE)),
+  YEAR(TRY_CONVERT(date, SUBMITTALDATE))
+ORDER BY YEAR(TRY_CONVERT(date, SUBMITTALDATE)), MONTH(TRY_CONVERT(date, SUBMITTALDATE));
+
 -- How many submittals did a recruiter make this month? (COUNT only — no UNION)
 SELECT COUNT(*) AS submittal_count
 FROM DataVista.dbo.CR_SubmittalMaster
