@@ -842,6 +842,160 @@ def normalize_user_question(question):
     return re.sub(r"\s+", " ", text).strip()
 
 
+def is_mixed_performance_question(question):
+    text = question or ""
+    has_stages = bool(
+        re.search(r"\b(submits?|submittals?|interviews?|offers?|starts?)\b", text, re.I)
+    )
+    has_hours = bool(re.search(r"\b(logged\s*hours?|avg|average)\b", text, re.I))
+    has_perf = bool(re.search(r"\bperformance\b", text, re.I))
+    return (has_perf and has_stages) or (has_stages and has_hours)
+
+
+def extract_month_year_bounds(question):
+    """Return (start_iso, end_iso) for a named month, or this month if none named."""
+    text = question or ""
+    today = date.today()
+    month_lookup = {
+        "january": 1,
+        "jan": 1,
+        "february": 2,
+        "feb": 2,
+        "march": 3,
+        "mar": 3,
+        "april": 4,
+        "apr": 4,
+        "may": 5,
+        "june": 6,
+        "jun": 6,
+        "july": 7,
+        "jul": 7,
+        "august": 8,
+        "aug": 8,
+        "september": 9,
+        "sep": 9,
+        "sept": 9,
+        "october": 10,
+        "oct": 10,
+        "november": 11,
+        "nov": 11,
+        "december": 12,
+        "dec": 12,
+    }
+    months = "|".join(sorted(month_lookup.keys(), key=len, reverse=True))
+    year = today.year
+    month = today.month
+
+    match = re.search(rf"\b({months})\s+(\d{{4}})\b", text, re.IGNORECASE)
+    if match:
+        month = month_lookup[match.group(1).lower()]
+        year = int(match.group(2))
+    else:
+        match = re.search(rf"\b({months})\b", text, re.IGNORECASE)
+        if match:
+            month = month_lookup[match.group(1).lower()]
+            year = today.year
+        elif re.search(r"\bthis\s+month\b", text, re.IGNORECASE):
+            month = today.month
+            year = today.year
+
+    start = date(year, month, 1)
+    if month == 12:
+        end = date(year + 1, 1, 1)
+    else:
+        end = date(year, month + 1, 1)
+    return start.isoformat(), end.isoformat()
+
+
+def build_mixed_performance_sql(
+    question,
+    confirmed_username=None,
+    confirmed_employee_id=None,
+    primary_table=None,
+):
+    """
+    Deterministic SQL for recruiter performance + avg logged hours.
+    Avoids LLM inventing invalid DATEDIFF / object names (42000 / 42S02).
+    """
+    if not is_mixed_performance_question(question):
+        return None
+
+    name = (confirmed_username or "").strip()
+    if not name:
+        hints = extract_name_hints(question)
+        if not hints:
+            return None
+        name = " ".join(hints)
+
+    safe_name = sql_literal(name)
+    parts = [p for p in re.split(r"\s+", name) if p]
+    first = sql_literal(parts[0]) if parts else safe_name
+    last = sql_literal(parts[-1]) if len(parts) > 1 else ""
+
+    start_iso, end_iso = extract_month_year_bounds(question)
+    datavista_db = get_datavista_database_name()
+    prohance_db = get_connected_database_name()
+    table_name = primary_table or (
+        schema_provider.get_primary_table_name() if "schema_provider" in globals() else None
+    ) or "EmployeeAttendance"
+
+    if not prohance_db:
+        attendance_from = f"[dbo].[{table_name}]"
+    else:
+        attendance_from = f"[{prohance_db}].[dbo].[{table_name}]"
+
+    recruiter_filter = (
+        "("
+        f"PRIMARYRECRUITERNAME = '{safe_name}' "
+        f"OR PRIMARYRECRUITERNAME LIKE '{safe_name} %' "
+        f"OR PRIMARYRECRUITERNAME LIKE '{first}%' "
+        f"OR USERFIRSTNAME = '{first}' "
+    )
+    if last:
+        recruiter_filter += (
+            f"OR (USERFIRSTNAME = '{first}' AND USERLASTNAME = '{last}') "
+            f"OR (USERFIRSTNAME + ' ' + USERLASTNAME) = '{safe_name}' "
+        )
+    if confirmed_employee_id:
+        recruiter_filter += f"OR userid = '{sql_literal(confirmed_employee_id)}' "
+    recruiter_filter += ")"
+
+    hours_person = (
+        f"(userName = '{safe_name}' OR userName LIKE '{safe_name}%' OR userName LIKE '{first}%')"
+    )
+
+    def _count_subquery(table, date_col, alias):
+        return (
+            f"(SELECT COUNT(*) FROM [{datavista_db}].[dbo].[{table}] "
+            f"WHERE TRY_CONVERT(date, {date_col}) >= '{start_iso}' "
+            f"AND TRY_CONVERT(date, {date_col}) < '{end_iso}' "
+            f"AND {recruiter_filter}) AS {alias}"
+        )
+
+    avg_hours = (
+        "(SELECT CAST(ROUND(AVG(COALESCE("
+        "DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(logged_hours)), '') AS TIME)), "
+        "0)), 0) AS int) "
+        f"FROM {attendance_from} "
+        f"WHERE {hours_person} "
+        f"AND sessionDate >= '{start_iso}' "
+        f"AND sessionDate < '{end_iso}') AS avg_logged_seconds"
+    )
+
+    return (
+        "SELECT "
+        + ", ".join(
+            [
+                _count_subquery("CR_SubmittalMaster", "SUBMITTALDATE", "submittals"),
+                _count_subquery("CR_InterviewMaster", "INTERVIEWDATE", "interviews"),
+                _count_subquery("CR_HireMaster", "PLACEMENTDATE", "offers"),
+                _count_subquery("CR_HireMaster", "STARTDATE", "starts"),
+                avg_hours,
+            ]
+        )
+    )
+
+
 def enhance_for_sql(question, history=None, domain=None):
     notes = []
     text = question or ""
@@ -929,14 +1083,11 @@ def enhance_for_sql(question, history=None, domain=None):
             f"[{prohance_db}].[dbo].[{prohance_table}]. "
             "Never invent a database named Prohance/Workforce/Attendance — "
             f"attendance lives in [{prohance_db}].[dbo].[{prohance_table}]. "
-            "Columns for the requested month/period: "
-            "submittals = COUNT(*) from CR_SubmittalMaster (SUBMITTALDATE); "
-            "interviews = COUNT(*) from CR_InterviewMaster (INTERVIEWDATE); "
-            "offers = COUNT(*) from CR_HireMaster (PLACEMENTDATE); "
-            "starts = COUNT(*) from CR_HireMaster (STARTDATE); "
-            f"avg_logged_seconds = AVG(DATEDIFF seconds of logged_hours) from "
-            f"[{prohance_db}].[dbo].[{prohance_table}] where userName matches the person "
-            "and sessionDate in the same period. "
+            "Alias columns exactly: submittals, interviews, offers, starts, avg_logged_seconds. "
+            "For avg hours use EXACTLY: "
+            "CAST(ROUND(AVG(COALESCE(DATEDIFF(SECOND, 0, "
+            "TRY_CAST(NULLIF(LTRIM(RTRIM(logged_hours)), '') AS TIME)), 0)), 0) AS int). "
+            "Never write 'DATEDIFF seconds of logged_hours' — that is invalid SQL. "
             "Filter DataVista on PRIMARYRECRUITERNAME / USERFIRSTNAME / USERLASTNAME."
         )
 
@@ -1333,13 +1484,14 @@ def fix_datavista_schema(sql):
     if not sql:
         return sql
 
+    # Only rewrite invented TABLE names in table position (FROM/JOIN/APPLY).
+    # Never rewrite aliases like "AS submittals" — that produced 42000 syntax errors.
     table_aliases = {
         "cr_submitmaster": "CR_SubmittalMaster",
         "cr_submittals": "CR_SubmittalMaster",
         "cr_submissionmaster": "CR_SubmittalMaster",
         "submittalmaster": "CR_SubmittalMaster",
-        "submittals": "CR_SubmittalMaster",
-        "submissions": "CR_SubmittalMaster",
+        "submissionmaster": "CR_SubmittalMaster",
         "cr_hire": "CR_HireMaster",
         "cr_hires": "CR_HireMaster",
         "hiremaster": "CR_HireMaster",
@@ -1350,8 +1502,11 @@ def fix_datavista_schema(sql):
     }
     for wrong, right in table_aliases.items():
         sql = re.sub(
-            rf"(?<![\w.\]])\[?{wrong}\]?\b",
-            right,
+            rf"(\b(?:FROM|JOIN|APPLY)\s+)"
+            rf"(?:(?:\[[^\]]+\]|[A-Za-z0-9_]+)\s*\.\s*)?"
+            rf"(?:\[?dbo\]?\s*\.\s*)?"
+            rf"\[?{re.escape(wrong)}\]?\b",
+            rf"\1{right}",
             sql,
             flags=re.IGNORECASE,
         )
@@ -1465,17 +1620,18 @@ def fix_prohance_object_names(sql, db_name=None, table_name=None):
         flags=re.IGNORECASE,
     )
 
-    # Bare EmployeeAttendance → three-part name when query already touches DataVista.
+    # Bare unbracketed EmployeeAttendance → three-part when query already touches DataVista.
+    # Do NOT use optional \[? \]?\ — that ate into [EmployeeAttendance] and double-wrapped (42000).
     if re.search(r"\bCR_(?:Submittal|Interview|Hire|Reject)Master\b", sql, re.IGNORECASE):
         sql = re.sub(
-            rf"(?<![\w.\]])\[?EmployeeAttendance\]?(?![\w.\]])",
+            rf"(?<![\w.\[])\bEmployeeAttendance\b(?![\w.\]])",
             target,
             sql,
             flags=re.IGNORECASE,
         )
         if table_name.lower() != "employeeattendance":
             sql = re.sub(
-                rf"(?<![\w.\]])\[?{re.escape(table_name)}\]?(?![\w.\]])",
+                rf"(?<![\w.\[])\b{re.escape(table_name)}\b(?![\w.\]])",
                 target,
                 sql,
                 flags=re.IGNORECASE,
@@ -3846,19 +4002,29 @@ def ask_question():
                 }
             )
 
-        sql_query = generate_sql(
+        sql_query = build_mixed_performance_sql(
             question,
-            history,
-            primary_table,
-            confirmed_username,
-            confirmed_employee_id,
-            domain=domain,
+            confirmed_username=confirmed_username,
+            confirmed_employee_id=confirmed_employee_id,
+            primary_table=primary_table,
         )
+        if not sql_query:
+            sql_query = generate_sql(
+                question,
+                history,
+                primary_table,
+                confirmed_username,
+                confirmed_employee_id,
+                domain=domain,
+            )
         sql_query = clean_sql(sql_query, primary_table or "EmployeeAttendance")
         sql_query = remove_broad_query_limit(sql_query, question)
         sql_query = ensure_single_readonly_sql(sql_query)
-        if domain == "datavista":
+        if domain == "datavista" or is_mixed_performance_question(question):
             sql_query = qualify_datavista_sql(sql_query)
+            sql_query = fix_prohance_object_names(
+                sql_query, table_name=primary_table or "EmployeeAttendance"
+            )
 
         if sql_query.upper() == "NA":
             return jsonify(
@@ -3929,7 +4095,10 @@ def ask_question():
         invalid_object = bool(
             re.search(r"42S02|invalid object name", detail, re.IGNORECASE)
         )
-        if domain == "datavista":
+        syntax_error = bool(
+            re.search(r"42000|incorrect syntax|syntax error", detail, re.IGNORECASE)
+        )
+        if domain == "datavista" or is_mixed_performance_question(question):
             hint = (
                 "This looked like a DataVista (recruiting) question. "
                 "Use SUBMITTALDATE (not SubmitDate), PRIMARYRECRUITERNAME, "
@@ -3941,6 +4110,11 @@ def ask_question():
                     " For mixed performance (submits + logged hours), do not invent a "
                     "database named Prohance — use the connected attendance database/"
                     "table three-part name from the schema notes."
+                )
+            if syntax_error:
+                hint += (
+                    " Check aliases like AS submittals were not rewritten into table names, "
+                    "and avg hours uses DATEDIFF(SECOND, 0, TRY_CAST(logged_hours AS TIME))."
                 )
         else:
             hint = (
@@ -3954,6 +4128,8 @@ def ask_question():
                     " Do not invent database/table names; use the connected database "
                     "and the live attendance table from schema."
                 )
+            if syntax_error:
+                hint += " Open the SQL below — a syntax error (42000) usually means a broken rewrite."
         return jsonify(
             {
                 "query": sql_query,
