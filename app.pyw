@@ -803,6 +803,17 @@ def normalize_user_question(question):
     text = re.sub(r"\bthat['’]?s\b", "that is", text, flags=re.IGNORECASE)
     text = re.sub(r"\bthere['’]?s\b", "there is", text, flags=re.IGNORECASE)
 
+    # Common glued / typo forms from chat.
+    text = re.sub(
+        r"\bmonthly(submits?|submittals?|submissions?|hires?|interviews?|"
+        r"starts?|rejects?|offers?)\b",
+        r"monthly \1",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"\blogged\s*ours\b", "logged hours", text, flags=re.IGNORECASE)
+    text = re.sub(r"\blog+ed\s*hours?\b", "logged hours", text, flags=re.IGNORECASE)
+
     stage_words = (
         r"submits?|submittals?|submissions?|hires?|interviews?|rejects?|"
         r"clients?|placements?|offers?"
@@ -860,7 +871,7 @@ def normalize_user_question(question):
     if (
         not already_count
         and re.search(rf"\b({stage_words})\b", text, re.I)
-        and not re.search(r"\b(show|list)\b", text, re.I)
+        and not re.search(r"\b(show|list|give|tell|monthly|month\s*by\s*month)\b", text, re.I)
         and extract_name_hints(text)
     ):
         text = "how many " + text
@@ -1112,20 +1123,27 @@ def build_month_breakdown_with_hours_followup_sql(
     primary_table=None,
 ):
     """
-    Follow-up like "also show logged hours" after a month-by-month ask.
-    Keeps prior months/year and prior stage columns, adds logged hours by month.
+    Month-by-month recruiting stages + logged hours.
+    Handles first asks ("monthly submits and logged hours") and follow-ups
+    ("also show logged hours" after a month-by-month stage ask).
     """
     text = question or ""
-    if not is_continuation_followup(text):
+    asks_hours = bool(
+        re.search(
+            r"\b(logged\s*hours?|logged\s*ours|avg(?:erage)?\s+(?:logged\s*)?hours?|"
+            r"total\s+(?:logged\s*)?hours?|hours?\s+logged|\bhours?\b)\b",
+            text,
+            re.IGNORECASE,
+        )
+    )
+    if not asks_hours:
         return None
-    if not prior_wants_month_breakdown(history, last_result):
-        return None
-    if not re.search(r"\b(logged\s*hours?|\bhours?\b|avg|average)\b", text, re.I):
+    if not effective_wants_month_breakdown(text, history, last_result):
         return None
 
     prior_q = prior_question_text(history, last_result)
     stages = requested_datavista_stages(text)
-    if len(stages) < 1:
+    if len(stages) < 1 and prior_q:
         stages = requested_datavista_stages(prior_q)
     # If no recruiting stages in the thread, plain hours month-breakdown handles it.
     if len(stages) < 1:
@@ -1355,8 +1373,13 @@ def build_mixed_performance_sql(
     """
     Deterministic SQL for recruiter performance + avg logged hours.
     Avoids LLM inventing invalid DATEDIFF / object names (42000 / 42S02).
+    Single-row totals only — monthly / month-by-month mixed asks are handled
+    by build_month_breakdown_with_hours_followup_sql.
     """
     if not is_mixed_performance_question(question):
+        return None
+    # Do not steal month-by-month asks (e.g. monthly submits + logged hours).
+    if wants_month_breakdown(question):
         return None
 
     name = (confirmed_username or "").strip()
@@ -5964,12 +5987,22 @@ def ask_question():
                 }
             )
 
-        sql_query = build_mixed_performance_sql(
+        # Month-by-month stages + hours first so mixed single-row totals do not win.
+        sql_query = build_month_breakdown_with_hours_followup_sql(
             question,
+            history=history,
+            last_result=last_result,
             confirmed_username=confirmed_username,
             confirmed_employee_id=confirmed_employee_id,
             primary_table=primary_table,
         )
+        if not sql_query:
+            sql_query = build_mixed_performance_sql(
+                question,
+                confirmed_username=confirmed_username,
+                confirmed_employee_id=confirmed_employee_id,
+                primary_table=primary_table,
+            )
         if not sql_query:
             sql_query = build_datavista_stage_counts_sql(
                 question,
@@ -5977,15 +6010,6 @@ def ask_question():
                 confirmed_employee_id=confirmed_employee_id,
                 history=history,
                 last_result=last_result,
-            )
-        if not sql_query:
-            sql_query = build_month_breakdown_with_hours_followup_sql(
-                question,
-                history=history,
-                last_result=last_result,
-                confirmed_username=confirmed_username,
-                confirmed_employee_id=confirmed_employee_id,
-                primary_table=primary_table,
             )
         if not sql_query:
             sql_query = build_month_breakdown_hours_sql(
