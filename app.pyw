@@ -985,14 +985,78 @@ def _recruiting_period_bounds(question):
     )
     year = extract_year_from_question(text)
     if year is not None and not month_named:
-        return f"{year}-01-01", f"{year + 1}-01-01"
+        return monthly_year_bounds(year)
     if re.search(r"\bthis\s+year\b", text, re.IGNORECASE) and not month_named:
-        y = date.today().year
-        return f"{y}-01-01", f"{y + 1}-01-01"
+        return monthly_year_bounds(date.today().year)
     if month_named or re.search(r"\bthis\s+month|last\s+month\b", text, re.IGNORECASE):
         return extract_period_bounds(question)
-    y = date.today().year
-    return f"{y}-01-01", f"{y + 1}-01-01"
+    return monthly_year_bounds(date.today().year)
+
+
+_MONTH_NUM_LABELS = (
+    (1, "January"),
+    (2, "February"),
+    (3, "March"),
+    (4, "April"),
+    (5, "May"),
+    (6, "June"),
+    (7, "July"),
+    (8, "August"),
+    (9, "September"),
+    (10, "October"),
+    (11, "November"),
+    (12, "December"),
+)
+
+
+def monthly_year_bounds(year):
+    """
+    Year period for monthly tables.
+    Current year → Jan 1 through the first day of next month (YTD months).
+    Past/future years → full calendar year.
+    """
+    today = date.today()
+    y = int(year)
+    start = f"{y}-01-01"
+    if y == today.year:
+        end_y, end_m = _add_months(today.year, today.month, 1)
+        return start, f"{end_y}-{end_m:02d}-01"
+    return start, f"{y + 1}-01-01"
+
+
+def month_spine_rows(start_iso, end_iso):
+    """List of (month_name, month_num, year) from start inclusive to end exclusive."""
+    start = date.fromisoformat(start_iso[:10])
+    end = date.fromisoformat(end_iso[:10])
+    rows = []
+    year, month = start.year, start.month
+    # Align to first of month.
+    cursor = date(year, month, 1)
+    while cursor < end:
+        label = _MONTH_NUM_LABELS[cursor.month - 1][1]
+        rows.append((label, cursor.month, cursor.year))
+        ny, nm = _add_months(cursor.year, cursor.month, 1)
+        cursor = date(ny, nm, 1)
+    if not rows:
+        today = date.today()
+        rows.append((_MONTH_NUM_LABELS[today.month - 1][1], today.month, today.year))
+    return rows
+
+
+def build_month_spine_sql(start_iso, end_iso):
+    """
+    Fixed month table: January … current month (or full year), so empty months
+    still appear as rows.
+    """
+    values = ", ".join(
+        f"('{sql_literal(name)}', {num}, {year})"
+        for name, num, year in month_spine_rows(start_iso, end_iso)
+    )
+    return (
+        "(SELECT * FROM (VALUES "
+        + values
+        + ") AS spine(month, _month_num, _year_num))"
+    )
 
 
 def build_datavista_stage_counts_sql(
@@ -1051,7 +1115,8 @@ def build_datavista_stage_counts_sql(
     recruiter_filter, _, _ = _datavista_recruiter_filter(name, confirmed_employee_id)
 
     if month_mode:
-        # One row per month; metric columns in ask order after month.
+        # Fixed month spine (Jan … current month) LEFT JOIN stage counts so
+        # every month row appears even when a metric is zero.
         union_parts = []
         for stage in stages:
             table, date_col = _STAGE_TABLE_DATE[stage]
@@ -1069,24 +1134,31 @@ def build_datavista_stage_counts_sql(
                 f"{expr} AS {s}" for s, expr in zip(stages, count_cols)
             )
             union_parts.append(
-                f"SELECT DATENAME(month, {date_expr}) AS month, "
-                f"MONTH({date_expr}) AS _month_num, "
+                f"SELECT MONTH({date_expr}) AS _month_num, "
                 f"YEAR({date_expr}) AS _year_num, "
                 f"{select_counts} "
                 f"FROM [{datavista_db}].[dbo].[{table}] "
                 f"WHERE {date_expr} >= '{start_iso}' AND {date_expr} < '{end_iso}' "
                 f"AND {recruiter_filter} "
-                f"GROUP BY DATENAME(month, {date_expr}), MONTH({date_expr}), YEAR({date_expr})"
+                f"GROUP BY MONTH({date_expr}), YEAR({date_expr})"
             )
         sum_cols = ", ".join(f"SUM({s}) AS {s}" for s in stages)
+        coalesce_cols = ", ".join(
+            f"COALESCE(s.{stage}, 0) AS {stage}" for stage in stages
+        )
+        spine = build_month_spine_sql(start_iso, end_iso)
         return (
-            "SELECT month, "
-            + sum_cols
-            + " FROM ("
+            f"SELECT spine.month, {coalesce_cols} "
+            f"FROM {spine} AS spine "
+            "LEFT JOIN ("
+            f"SELECT _month_num, _year_num, {sum_cols} "
+            "FROM ("
             + " UNION ALL ".join(union_parts)
             + ") AS stage_months "
-            "GROUP BY month, _month_num, _year_num "
-            "ORDER BY _year_num, _month_num"
+            "GROUP BY _month_num, _year_num"
+            ") AS s ON spine._month_num = s._month_num "
+            "AND spine._year_num = s._year_num "
+            "ORDER BY spine._year_num, spine._month_num"
         )
 
     select_parts = []
@@ -1115,9 +1187,14 @@ def build_datavista_stage_counts_sql(
 
 
 def sql_has_month_breakdown(sql):
-    """True when SQL returns one row per month via DATENAME(month, ...)."""
+    """True when SQL returns one row per month (spine or DATENAME grouping)."""
     return bool(
-        re.search(r"\bDATENAME\s*\(\s*month\b", sql or "", re.IGNORECASE)
+        re.search(
+            r"\bDATENAME\s*\(\s*month\b|_month_num\b|AS spine\b|"
+            r"VALUES\s*\(\s*'January'",
+            sql or "",
+            re.IGNORECASE,
+        )
     )
 
 
@@ -1215,40 +1292,41 @@ def build_month_breakdown_with_hours_followup_sql(
         count_cols = ["COUNT(*)" if s == stage else "0" for s in stages]
         select_counts = ", ".join(f"{expr} AS {s}" for s, expr in zip(stages, count_cols))
         union_parts.append(
-            f"SELECT DATENAME(month, {date_expr}) AS month, "
-            f"MONTH({date_expr}) AS _month_num, YEAR({date_expr}) AS _year_num, "
+            f"SELECT MONTH({date_expr}) AS _month_num, YEAR({date_expr}) AS _year_num, "
             f"{select_counts} "
             f"FROM [{datavista_db}].[dbo].[{table}] "
             f"WHERE {date_expr} >= '{start_iso}' AND {date_expr} < '{end_iso}' "
             f"AND {recruiter_filter} "
-            f"GROUP BY DATENAME(month, {date_expr}), MONTH({date_expr}), YEAR({date_expr})"
+            f"GROUP BY MONTH({date_expr}), YEAR({date_expr})"
         )
 
-    # Aggregate stages first, then join hours. Use a single alias (AS s) —
-    # "AS stage_rows s" is invalid T-SQL and caused SQL error 42000.
+    # Fixed Jan…current-month spine, then stages + hours (zeros when missing).
     sum_cols = ", ".join(f"SUM({stage}) AS {stage}" for stage in stages)
+    stage_select = ", ".join(
+        f"COALESCE(s.{stage}, 0) AS {stage}" for stage in stages
+    )
+    spine = build_month_spine_sql(start_iso, end_iso)
     return (
-        "SELECT s.month, "
-        + ", ".join(f"s.{stage}" for stage in stages)
-        + f", h.{hours_alias} AS {hours_alias} "
-        "FROM ("
-        f"SELECT month, _month_num, _year_num, {sum_cols} "
+        f"SELECT spine.month, {stage_select}, "
+        f"COALESCE(h.{hours_alias}, 0) AS {hours_alias} "
+        f"FROM {spine} AS spine "
+        "LEFT JOIN ("
+        f"SELECT _month_num, _year_num, {sum_cols} "
         "FROM ("
         + " UNION ALL ".join(union_parts)
         + ") AS stage_rows "
-        "GROUP BY month, _month_num, _year_num"
-        ") AS s "
+        "GROUP BY _month_num, _year_num"
+        ") AS s ON spine._month_num = s._month_num AND spine._year_num = s._year_num "
         "LEFT JOIN ("
-        f"SELECT DATENAME(month, sessionDate) AS month, "
-        f"MONTH(sessionDate) AS _month_num, YEAR(sessionDate) AS _year_num, "
+        f"SELECT MONTH(sessionDate) AS _month_num, YEAR(sessionDate) AS _year_num, "
         f"{hours_metric} AS {hours_alias} "
         f"FROM {attendance_from} "
         f"WHERE (userName = '{safe_person}' OR userName LIKE '{safe_person}%' "
         f"OR userName LIKE '{first}%') "
         f"AND sessionDate >= '{start_iso}' AND sessionDate < '{end_iso}' "
-        "GROUP BY DATENAME(month, sessionDate), MONTH(sessionDate), YEAR(sessionDate)"
-        ") AS h ON s._month_num = h._month_num AND s._year_num = h._year_num "
-        "ORDER BY s._year_num, s._month_num"
+        "GROUP BY MONTH(sessionDate), YEAR(sessionDate)"
+        ") AS h ON spine._month_num = h._month_num AND spine._year_num = h._year_num "
+        "ORDER BY spine._year_num, spine._month_num"
     )
 
 
@@ -4953,18 +5031,25 @@ def build_month_breakdown_hours_sql(
     )
     if use_avg:
         metric_expr = f"CAST(ROUND(AVG({seconds_expr}), 0) AS int) AS avg_seconds"
+        hours_alias = "avg_seconds"
     else:
         metric_expr = f"CAST(SUM({seconds_expr}) AS int) AS total_seconds"
+        hours_alias = "total_seconds"
 
+    spine = build_month_spine_sql(start_iso, end_iso)
     return (
-        "SELECT DATENAME(month, sessionDate) AS month, "
+        f"SELECT spine.month, COALESCE(h.{hours_alias}, 0) AS {hours_alias} "
+        f"FROM {spine} AS spine "
+        "LEFT JOIN ("
+        f"SELECT MONTH(sessionDate) AS _month_num, YEAR(sessionDate) AS _year_num, "
         f"{metric_expr} "
         f"FROM {from_table} "
         f"WHERE (userName = '{safe_person}' OR userName LIKE '{safe_person}%' "
         f"OR userName LIKE '{first}%') "
         f"AND sessionDate >= '{start_iso}' AND sessionDate < '{end_iso}' "
-        "GROUP BY DATENAME(month, sessionDate), MONTH(sessionDate), YEAR(sessionDate) "
-        "ORDER BY YEAR(sessionDate), MONTH(sessionDate)"
+        "GROUP BY MONTH(sessionDate), YEAR(sessionDate)"
+        ") AS h ON spine._month_num = h._month_num AND spine._year_num = h._year_num "
+        "ORDER BY spine._year_num, spine._month_num"
     )
 
 
@@ -5050,13 +5135,14 @@ def extract_period_bounds(question):
         )
     )
 
-    # Year (2026 / for 26 / this year / "year") or bare month-breakdown wording
-    # without a single named month → full calendar year, one row per month.
+    # Year (2026 / for 26 / this year) or monthly / month-by-month wording
+    # without a single named month → Jan through current month (YTD) for this
+    # year, or the full year for past years. One table row per month.
     if (year is not None or mentions_year_word or mentions_month_breakdown) and not month_named:
         y = year or today.year
         if re.search(r"\bthis\s+year\b", text, re.IGNORECASE):
             y = today.year
-        return f"{y}-01-01", f"{y + 1}-01-01"
+        return monthly_year_bounds(y)
 
     if not month_named:
         if re.search(r"\bthis\s+month\b", text, re.IGNORECASE):
@@ -5226,8 +5312,7 @@ def resolve_period_bounds(question, history=None, last_result=None):
             return extract_period_bounds(prior_q)
 
     if effective_wants_month_breakdown(text, history, last_result):
-        y = date.today().year
-        return f"{y}-01-01", f"{y + 1}-01-01"
+        return monthly_year_bounds(date.today().year)
 
     return extract_period_bounds(text)
 
