@@ -2107,18 +2107,187 @@ def _is_duration_label_column(name):
     }
 
 
-def enrich_duration_results(results):
-    """
-    Add one human-readable `duration` field and drop redundant clones.
+def _norm_col(name):
+    return re.sub(r"[^a-z0-9]+", "", (name or "").lower())
 
-    Users should see logged_hours + duration — not also logged_seconds,
-    logged_duration, logged_hours_duration, etc.
+
+def extract_requested_metric_order(question):
     """
+    Metric aliases in the order the user asked, e.g.
+    "logged hours, avg logged hours and break" →
+    ["logged_hours", "avg_logged_hours", "break"].
+    """
+    text = question or ""
+    if not text.strip():
+        return []
+
+    specs = [
+        ("avg_logged_hours", re.compile(r"avg(?:erage)?\s+logged\s*hours?", re.I)),
+        ("avg_logged_hours", re.compile(r"avg(?:erage)?\s+hours?", re.I)),
+        ("avg_break", re.compile(r"avg(?:erage)?\s+breaks?", re.I)),
+        ("logged_hours", re.compile(r"logged\s*hours?", re.I)),
+        ("logged_hours", re.compile(r"total\s+(?:logged\s*)?hours?", re.I)),
+        ("break", re.compile(r"\bbreaks?\b", re.I)),
+        ("aafs", re.compile(r"\baafs\b", re.I)),
+        ("submittals", re.compile(r"\bsubmitt?als?\b|\bsubmits?\b", re.I)),
+        ("interviews", re.compile(r"\binterviews?\b", re.I)),
+        ("offers", re.compile(r"\boffers?\b", re.I)),
+        ("starts", re.compile(r"\bstarts?\b", re.I)),
+    ]
+
+    matches = []
+    for alias, cre in specs:
+        for match in cre.finditer(text):
+            matches.append((match.start(), match.end(), alias))
+    matches.sort(key=lambda item: (item[0], -(item[1] - item[0])))
+
+    used = [False] * (len(text) + 1)
+    ordered = []
+    for start, end, alias in matches:
+        if any(used[idx] for idx in range(start, end)):
+            continue
+        for idx in range(start, end):
+            used[idx] = True
+        if alias not in ordered:
+            ordered.append(alias)
+    return ordered
+
+
+def _metric_bucket_for_column(col_name):
+    """Map a result column to a requested-metric alias, when possible."""
+    key = _norm_col(col_name)
+    if key in {"month", "monthname", "mon"}:
+        return "month"
+    if "avg" in key and "break" in key:
+        return "avg_break"
+    if "avg" in key and (
+        "hour" in key or "logged" in key or key in {"avgseconds", "averageseconds"}
+    ):
+        return "avg_logged_hours"
+    if "break" in key:
+        return "break"
+    if key == "aafs" or key.startswith("aafs"):
+        return "aafs"
+    if key in {
+        "loggedhours",
+        "totalseconds",
+        "loggedseconds",
+        "totalloggedseconds",
+        "totalhours",
+        "hours",
+        "duration",
+        "loggedduration",
+    } or (
+        "logged" in key
+        and "avg" not in key
+        and "break" not in key
+    ) or (
+        key.endswith("seconds")
+        and "avg" not in key
+        and "break" not in key
+        and "month" not in key
+    ):
+        return "logged_hours"
+    if "submittal" in key or key in {"submits", "submit"}:
+        return "submittals"
+    if "interview" in key:
+        return "interviews"
+    if "offer" in key or "placement" in key or "hire" in key:
+        return "offers"
+    if key in {"starts", "start", "startdate"} or (
+        "start" in key and "login" not in key
+    ):
+        return "starts"
+    return None
+
+
+def _friendly_display_name(col_name, bucket=None):
+    if bucket == "logged_hours":
+        return "logged_hours"
+    if bucket == "avg_logged_hours":
+        return "avg_logged_hours"
+    if bucket == "avg_break":
+        return "avg_break"
+    if bucket == "break":
+        return "break"
+    if bucket == "month":
+        return "month"
+    if _is_seconds_column(col_name):
+        base = re.sub(r"_?seconds?$", "", col_name, flags=re.IGNORECASE).strip("_")
+        return base or col_name
+    return col_name
+
+
+def order_result_columns(results, question=None):
+    """Put month first (for month breakdowns), then metrics in ask-order, then the rest."""
     if not results:
         return results
 
-    def _norm(name):
-        return re.sub(r"[^a-z0-9]+", "", (name or "").lower())
+    keys = list(results[0].keys())
+    metric_order = extract_requested_metric_order(question)
+    month_keys = [
+        k
+        for k in keys
+        if _metric_bucket_for_column(k) == "month" or _norm_col(k) == "month"
+    ]
+    is_monthy = bool(month_keys) or bool(month_breakdown_guidance(question))
+
+    preferred = []
+    seen = set()
+
+    def _add(key):
+        if key in keys and key not in seen:
+            preferred.append(key)
+            seen.add(key)
+
+    if is_monthy:
+        for key in month_keys:
+            _add(key)
+        for metric in metric_order:
+            for key in keys:
+                if _metric_bucket_for_column(key) == metric:
+                    _add(key)
+        for name in ("userName", "username", "employeeid", "sessionDate", "sessiondate"):
+            for key in keys:
+                if key.lower() == name.lower():
+                    _add(key)
+    else:
+        for name in (
+            "userName",
+            "username",
+            "employeeid",
+            "sessionDate",
+            "sessiondate",
+            "logged_hours",
+            "duration",
+        ):
+            for key in keys:
+                if key.lower() == name.lower():
+                    _add(key)
+        for metric in metric_order:
+            for key in keys:
+                if _metric_bucket_for_column(key) == metric:
+                    _add(key)
+
+    for key in keys:
+        _add(key)
+
+    ordered_rows = []
+    for row in results:
+        ordered_rows.append({key: row.get(key) for key in preferred if key in row})
+    return ordered_rows
+
+
+def enrich_duration_results(results, question=None):
+    """
+    Add human-readable duration values and drop redundant clones.
+
+    Simple logged-hours lists → keep logged_hours + one duration.
+    Month-by-month / multi-metric → keep each metric column (formatted),
+    with month first and metrics in the ask order.
+    """
+    if not results:
+        return results
 
     redundant_norms = {
         "loggedduration",
@@ -2133,11 +2302,64 @@ def enrich_duration_results(results):
         "loggedhoursseconds",
     }
 
+    is_monthy = bool(month_breakdown_guidance(question)) or any(
+        _metric_bucket_for_column(key) == "month" or _norm_col(key) == "month"
+        for key in results[0].keys()
+    )
+    seconds_cols = [key for key in results[0].keys() if _is_seconds_column(key)]
+    multi_metric = is_monthy or len(seconds_cols) > 1 or len(extract_requested_metric_order(question)) > 1
+
     enriched = []
     for row in results:
-        readable = None
+        if multi_metric:
+            cleaned = {}
+            filled_buckets = set()
+            # Prefer seconds metrics first so we format totals that can exceed 24h.
+            for key, value in row.items():
+                if not _is_seconds_column(key) or value is None:
+                    continue
+                bucket = _metric_bucket_for_column(key) or _norm_col(key)
+                display_name = _friendly_display_name(key, _metric_bucket_for_column(key))
+                try:
+                    readable = format_duration_seconds(float(value))
+                except (TypeError, ValueError):
+                    readable = None
+                if not readable:
+                    continue
+                cleaned[display_name] = readable
+                filled_buckets.add(bucket)
 
-        # Prefer integer seconds columns for totals/averages that can exceed 24h.
+            for key, value in row.items():
+                key_n = _norm_col(key)
+                if _is_seconds_column(key):
+                    continue
+                if key_n != "duration" and (
+                    key_n.endswith("duration") or key_n in redundant_norms
+                ):
+                    continue
+                bucket = _metric_bucket_for_column(key)
+                if bucket and bucket in filled_buckets and bucket != "month":
+                    continue
+                if bucket == "month" or key_n == "month":
+                    cleaned["month"] = value
+                    filled_buckets.add("month")
+                    continue
+                display_name = _friendly_display_name(key, bucket)
+                if value is not None and _is_duration_label_column(key):
+                    seconds = parse_hhmmss_to_seconds(value)
+                    if seconds is not None:
+                        cleaned[display_name] = format_duration_seconds(seconds)
+                        if bucket:
+                            filled_buckets.add(bucket)
+                        continue
+                cleaned[display_name] = value
+                if bucket:
+                    filled_buckets.add(bucket)
+            enriched.append(cleaned)
+            continue
+
+        # Single-metric / day-list path: logged_hours + one duration.
+        readable = None
         for key, value in row.items():
             if not _is_seconds_column(key) or value is None:
                 continue
@@ -2148,12 +2370,10 @@ def enrich_duration_results(results):
             if readable:
                 break
 
-        # Fall back to HH:MM:SS fields like logged_hours.
         if not readable:
             for key, value in row.items():
                 if not _is_duration_label_column(key) or value is None:
                     continue
-                # Skip keys that are already human labels (contain no clock pattern).
                 seconds = parse_hhmmss_to_seconds(value)
                 if seconds is None:
                     continue
@@ -2163,43 +2383,114 @@ def enrich_duration_results(results):
 
         cleaned = {}
         for key, value in row.items():
-            key_n = _norm(key)
-            # Hide seconds helpers from the table UI.
+            key_n = _norm_col(key)
             if _is_seconds_column(key):
                 continue
-            # Hide duplicate *duration aliases; keep a single `duration`.
             if key_n != "duration" and (
                 key_n.endswith("duration") or key_n in redundant_norms
             ):
                 continue
             cleaned[key] = value
-
         if readable:
             cleaned["duration"] = readable
+        enriched.append(cleaned)
 
-        # Stable-ish column order: identity/date, logged_hours, duration, then rest.
-        preferred = []
-        seen = set()
-        for name in (
-            "userName",
-            "username",
-            "employeeid",
-            "sessionDate",
-            "sessiondate",
-            "logged_hours",
-            "duration",
-        ):
-            for key in list(cleaned.keys()):
-                if key.lower() == name.lower() and key not in seen:
-                    preferred.append(key)
-                    seen.add(key)
-        ordered = {key: cleaned[key] for key in preferred}
-        for key, value in cleaned.items():
-            if key not in seen:
-                ordered[key] = value
+    enriched = enrich_month_name_results(enriched)
+    return order_result_columns(enriched, question)
 
-        enriched.append(ordered)
-    return enrich_month_name_results(enriched)
+
+def build_duration_answer_context(results, question=None):
+    """
+    Force answers to include human totals from total_seconds / duration fields.
+    Prefer raw seconds rows (before UI enrichment) so month totals can be summed.
+    """
+    if not results:
+        return ""
+
+    first = results[0]
+
+    # Single-row aggregate with seconds or duration.
+    if len(results) == 1:
+        parts = []
+        for key, value in first.items():
+            if value is None or value == "":
+                continue
+            key_l = str(key).lower()
+            if key_l in {"month", "username", "surname", "name", "employeeid", "sessiondate"}:
+                continue
+            label = key
+            display = value
+            if _is_seconds_column(key):
+                try:
+                    display = format_duration_seconds(float(value))
+                    label = _friendly_display_name(key, _metric_bucket_for_column(key))
+                except (TypeError, ValueError):
+                    continue
+            elif _metric_bucket_for_column(key) in {
+                "logged_hours",
+                "avg_logged_hours",
+                "break",
+                "avg_break",
+            } or "duration" in key_l:
+                seconds = parse_hhmmss_to_seconds(value)
+                if seconds is not None:
+                    display = format_duration_seconds(seconds)
+            else:
+                continue
+            if display:
+                parts.append(f"{label}={display}")
+        if parts:
+            return (
+                "REQUIRED: Your answer MUST include these logged-time value(s) verbatim: "
+                + "; ".join(parts)
+                + "."
+            )
+        return ""
+
+    # Multi-row / month-by-month: sum logged-hours seconds into one overall total.
+    logged_keys = [
+        key
+        for key in first.keys()
+        if _metric_bucket_for_column(key) == "logged_hours"
+    ]
+    if not logged_keys:
+        return (
+            "REQUIRED: Mention the key duration totals from the data using "
+            "days/weeks/hours wording (not raw seconds)."
+            if any(_is_seconds_column(k) or "duration" in str(k).lower() for k in first)
+            else ""
+        )
+
+    total_seconds = 0
+    parsed_any = False
+    for row in results:
+        for key in logged_keys:
+            value = row.get(key)
+            if value is None or value == "":
+                continue
+            seconds = None
+            if _is_seconds_column(key) or isinstance(value, (int, float)):
+                try:
+                    seconds = float(value)
+                except (TypeError, ValueError):
+                    seconds = None
+            if seconds is None:
+                seconds = parse_hhmmss_to_seconds(value)
+            if seconds is not None:
+                total_seconds += seconds
+                parsed_any = True
+                break  # one logged-hours metric per row
+    if parsed_any:
+        total_label = format_duration_seconds(total_seconds)
+        if total_label:
+            return (
+                "REQUIRED: Your answer MUST include the overall total logged time "
+                f"across all months/rows as: {total_label}."
+            )
+    return (
+        "REQUIRED: Mention the logged hours totals from the data "
+        "(use duration wording, not raw seconds)."
+    )
 
 
 _MONTH_NAMES = (
@@ -3770,6 +4061,19 @@ def month_breakdown_guidance(question):
         re.IGNORECASE,
     ):
         return None
+    metric_order = extract_requested_metric_order(question)
+    order_note = ""
+    if metric_order:
+        order_note = (
+            " Column order MUST be: month, then "
+            + ", ".join(metric_order)
+            + " (same order the user asked)."
+        )
+    else:
+        order_note = (
+            " Column order MUST start with month, then each metric in the "
+            "same order the user asked."
+        )
     return (
         "MONTH BREAKDOWN: Return one row per calendar month. "
         "Select ONLY DATENAME(month, <date>) AS month (display name like January). "
@@ -3777,6 +4081,9 @@ def month_breakdown_guidance(question):
         "ORDER BY YEAR(<date>), MONTH(<date>). "
         "Do NOT select MONTH(<date>) / month_num as an output column — "
         "users only want the month name, not a number column."
+        + order_note
+        + " For hours/breaks return INTEGER seconds columns "
+        "(total_seconds / avg_seconds / break_seconds) — the app formats duration."
     )
 
 
@@ -3960,6 +4267,7 @@ def generate_answer(
     confirmed_username,
     confirmed_employee_id,
     domain="prohance",
+    duration_hint="",
 ):
     enhanced_question = enhance_for_answer(question)
     prompt_question = format_for_prompt(
@@ -3980,6 +4288,8 @@ def generate_answer(
     extra = ""
     if len(results) > 5:
         extra = f"\nTotal rows returned: {len(results)}. Only the first 5 rows are shown above."
+    if duration_hint:
+        extra = f"{extra}\n{duration_hint}".strip()
 
     person_hint = ""
     if confirmed_username:
@@ -4006,6 +4316,8 @@ def generate_answer(
                 "'1 week 2 days and 3 hours'), USE THAT exact wording for time totals — "
                 "do not convert seconds yourself and do not quote HH:MM:SS clock times for "
                 "totals that can exceed 24 hours. "
+                "If the prompt includes a REQUIRED logged-time total, you MUST include that "
+                "exact duration wording in your answer. "
                 "Do not use markdown, bullets, headings, or tables. "
                 "Do not list rows or repeat every column — the UI already shows the data table underneath. "
                 "If the data is empty, say no matching records were found. "
@@ -4021,6 +4333,46 @@ def generate_answer(
             answer = build_compact_result_answer(question, results)
     except Exception:
         answer = build_compact_result_answer(question, results)
+
+    # If the model still omitted a required overall total, append it.
+    if duration_hint and results:
+        match = re.search(
+            r"overall total logged time across all months/rows as:\s*([^.]+)\.",
+            duration_hint,
+            flags=re.IGNORECASE,
+        )
+        overall = match.group(1).strip() if match else None
+        if not overall:
+            match = re.search(
+                r"verbatim:\s*([^=;]+=[^;]+)",
+                duration_hint,
+                flags=re.IGNORECASE,
+            )
+            if match:
+                # Prefer a logged_hours=... piece when present.
+                pieces = [
+                    p.strip()
+                    for p in re.findall(
+                        r"([A-Za-z0-9_]+=[^;]+)",
+                        duration_hint[match.start() :],
+                    )
+                ]
+                chosen = next(
+                    (p for p in pieces if p.lower().startswith("logged_hours=")),
+                    pieces[0] if pieces else None,
+                )
+                if chosen and "=" in chosen:
+                    overall = chosen.split("=", 1)[1].strip()
+        if overall and not re.search(
+            r"\b\d+\s+(week|day|hour|minute)s?\b",
+            answer or "",
+            re.IGNORECASE,
+        ):
+            answer = (
+                f"{answer} Total logged time: {overall}."
+                if answer
+                else f"Total logged time: {overall}."
+            ).strip()
 
     return answer, recommend_chart(results, "table", question)
 
@@ -4359,7 +4711,9 @@ def ask_question():
                 }
             )
 
-        results = enrich_duration_results(execute_sql(sql_query))
+        raw_results = execute_sql(sql_query)
+        duration_hint = build_duration_answer_context(raw_results, question)
+        results = enrich_duration_results(raw_results, question)
         candidates = get_candidates(results)
         if should_confirm(candidates, question, confirmed_employee_id, confirmed_username):
             hint_text = " ".join(extract_name_hints(question)) or "that name"
@@ -4393,6 +4747,7 @@ def ask_question():
             confirmed_username,
             confirmed_employee_id,
             domain=domain,
+            duration_hint=duration_hint,
         )
         chart_type = recommend_chart(results, chart_type, question)
 
