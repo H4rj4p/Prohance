@@ -1549,30 +1549,44 @@ def enhance_for_sql(question, history=None, domain=None):
     if (
         re.search(r"\bperformance\b", text, re.IGNORECASE)
         or (
-            re.search(r"\b(submits?|submittals?|interviews?|offers?|starts?)\b", text, re.I)
+            re.search(r"\b(submits?|submittals?|interviews?|offers?|starts?|hires?)\b", text, re.I)
             and re.search(r"\b(logged\s*hours?|avg|average)\b", text, re.I)
         )
     ):
         prohance_db = get_connected_database_name() or "YOUR_PROHANCE_DB"
         prohance_table = schema_provider.get_primary_table_name() or "EmployeeAttendance"
         datavista_db = get_datavista_database_name()
-        notes.append(
-            "PERFORMANCE / MIXED METRICS: Named person is the recruiter/user. "
-            "Return ONE SELECT with scalar subqueries / columns only. "
-            f"Use EXACT three-part names (do not invent databases/tables): "
-            f"[{datavista_db}].[dbo].[CR_SubmittalMaster], "
-            f"[{datavista_db}].[dbo].[CR_InterviewMaster], "
-            f"[{datavista_db}].[dbo].[CR_HireMaster], "
-            f"[{prohance_db}].[dbo].[{prohance_table}]. "
-            "Never invent a database named Prohance/Workforce/Attendance — "
-            f"attendance lives in [{prohance_db}].[dbo].[{prohance_table}]. "
-            "Alias columns exactly: submittals, interviews, offers, starts, avg_logged_seconds. "
-            "For avg hours use EXACTLY: "
-            "CAST(ROUND(AVG(COALESCE(DATEDIFF(SECOND, 0, "
-            "TRY_CAST(NULLIF(LTRIM(RTRIM(logged_hours)), '') AS TIME)), 0)), 0) AS int). "
-            "Never write 'DATEDIFF seconds of logged_hours' — that is invalid SQL. "
-            "Filter DataVista on PRIMARYRECRUITERNAME / USERFIRSTNAME / USERLASTNAME."
-        )
+        if wants_month_breakdown(text):
+            notes.append(
+                "MONTHLY MIXED METRICS (REQUIRED): Return ONE SELECT with "
+                "ONE ROW PER MONTH for the period (full year unless a single "
+                "month/range was named). Columns: month, then each requested "
+                "stage count, then logged hours seconds. "
+                "Do NOT return a single total row. "
+                "Do NOT use only scalar subqueries without DATENAME(month, ...) "
+                "GROUP BY. "
+                f"Use [{datavista_db}].[dbo].[CR_*] and "
+                f"[{prohance_db}].[dbo].[{prohance_table}]. "
+                "Hours alias: total_seconds or avg_seconds (integer seconds)."
+            )
+        else:
+            notes.append(
+                "PERFORMANCE / MIXED METRICS: Named person is the recruiter/user. "
+                "Return ONE SELECT with scalar subqueries / columns only. "
+                f"Use EXACT three-part names (do not invent databases/tables): "
+                f"[{datavista_db}].[dbo].[CR_SubmittalMaster], "
+                f"[{datavista_db}].[dbo].[CR_InterviewMaster], "
+                f"[{datavista_db}].[dbo].[CR_HireMaster], "
+                f"[{prohance_db}].[dbo].[{prohance_table}]. "
+                "Never invent a database named Prohance/Workforce/Attendance — "
+                f"attendance lives in [{prohance_db}].[dbo].[{prohance_table}]. "
+                "Alias columns exactly: submittals, interviews, offers, starts, avg_logged_seconds. "
+                "For avg hours use EXACTLY: "
+                "CAST(ROUND(AVG(COALESCE(DATEDIFF(SECOND, 0, "
+                "TRY_CAST(NULLIF(LTRIM(RTRIM(logged_hours)), '') AS TIME)), 0)), 0) AS int). "
+                "Never write 'DATEDIFF seconds of logged_hours' — that is invalid SQL. "
+                "Filter DataVista on PRIMARYRECRUITERNAME / USERFIRSTNAME / USERLASTNAME."
+            )
 
     if not notes:
         return question
@@ -6061,6 +6075,48 @@ def ask_question():
                 or _person_from_history_questions(history),
                 primary_table=primary_table,
             )
+            if rebuilt:
+                sql_query = rebuilt
+
+        # Hard guard: monthly / month-by-month / year asks must not return a
+        # single total row (mixed performance / LLM often emit one row with
+        # submittals, interviews, offers, starts, avg_logged_seconds).
+        if effective_wants_month_breakdown(
+            question, history=history, last_result=last_result
+        ) and not re.search(
+            r"\bDATENAME\s*\(\s*month\b", sql_query or "", re.IGNORECASE
+        ):
+            person_for_month = (
+                confirmed_username
+                or _extract_username_from_sql(sql_query)
+                or _person_from_history_questions(history)
+                or " ".join(extract_name_hints(question) or [])
+            ).strip()
+            rebuilt = build_month_breakdown_with_hours_followup_sql(
+                question,
+                history=history,
+                last_result=last_result,
+                confirmed_username=person_for_month or None,
+                confirmed_employee_id=confirmed_employee_id,
+                primary_table=primary_table,
+            )
+            if not rebuilt:
+                rebuilt = build_datavista_stage_counts_sql(
+                    question,
+                    confirmed_username=person_for_month or None,
+                    confirmed_employee_id=confirmed_employee_id,
+                    history=history,
+                    last_result=last_result,
+                )
+            if not rebuilt:
+                rebuilt = build_month_breakdown_hours_sql(
+                    question,
+                    confirmed_username=person_for_month or None,
+                    confirmed_employee_id=confirmed_employee_id,
+                    primary_table=primary_table,
+                    history=history,
+                    last_result=last_result,
+                )
             if rebuilt:
                 sql_query = rebuilt
 
