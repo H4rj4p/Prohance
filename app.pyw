@@ -4893,8 +4893,8 @@ def extract_period_bounds(question):
     """
     Return (start_iso, end_iso) for:
       - inclusive month ranges (January to March)
-      - month-by-month / month-to-month → full calendar year
-      - a named month, year, or this month
+      - year / month-by-month asks → full calendar year
+      - a named month, or this month
     """
     text = question or ""
     today = date.today()
@@ -4903,78 +4903,72 @@ def extract_period_bounds(question):
     if ranged:
         return ranged
 
-    # Month-by-month / month-to-month → all months of that year.
-    if re.search(
-        r"\b("
-        r"month\s*by\s*month|month\s*to\s*month|month\s+over\s+month|"
-        r"by\s+month|each\s+month|monthly(?:\s+breakdown)?|per\s+month|\bmom\b"
-        r")\b",
-        text,
-        re.IGNORECASE,
-    ):
-        year = extract_year_from_question(text) or today.year
-        if re.search(r"\bthis\s+year\b", text, re.IGNORECASE):
-            year = today.year
-        return f"{year}-01-01", f"{year + 1}-01-01"
-
     month_named = bool(
         re.search(rf"\b({_CALENDAR_MONTHS})\b", text, re.IGNORECASE)
     )
-    if not month_named:
-        if re.search(r"\bthis\s+year\b", text, re.IGNORECASE):
-            y = today.year
-            return f"{y}-01-01", f"{y + 1}-01-01"
-        year = extract_year_from_question(text)
-        if year is not None and not re.search(r"\bthis\s+month\b", text, re.IGNORECASE):
-            return f"{year}-01-01", f"{year + 1}-01-01"
-    return extract_month_year_bounds(question)
-
-
-def wants_month_breakdown(question):
-    """True when the user wants one row per calendar month."""
-    text = question or ""
-    if re.search(
-        r"\b("
-        r"month\s*by\s*month|month\s*to\s*month|by\s+month|each\s+month|"
-        r"monthly\s+breakdown|per\s+month|months?\s+this\s+year|"
-        r"month\s+over\s+month|\bmom\b|monthly"
-        r")\b",
-        text,
-        re.IGNORECASE,
-    ):
-        return True
-    # Inclusive multi-month ranges imply month-by-month rows when metrics are asked.
-    if extract_month_range_bounds(text) and re.search(
-        r"\b("
-        r"logged\s*hours?|hours?|break|submitt?als?|submits?|interviews?|"
-        r"hires?|offers?|starts?|rejects?|avg|average|total"
-        r")\b",
-        text,
-        re.IGNORECASE,
-    ):
-        return True
-    # "2026 total logged hours" / "for 26" / "total hours this year" → month-by-month
-    has_year = bool(
-        extract_year_from_question(text) is not None
-        or re.search(r"\bthis\s+year\b", text, re.IGNORECASE)
+    year = extract_year_from_question(text)
+    mentions_year_word = bool(
+        re.search(r"\b(?:this\s+)?years?\b|\byearly\b", text, re.IGNORECASE)
     )
-    has_hours = bool(
+    mentions_month_breakdown = bool(
         re.search(
             r"\b("
-            r"logged\s*hours?|total\s+(?:logged\s*)?hours?|hours?\s+logged|"
-            r"avg(?:erage)?\s+(?:logged\s*)?hours?|breaks?|total\s+break"
+            r"month\s*by\s*month|month\s*to\s*month|month\s+over\s+month|"
+            r"by\s+month|each\s+month|monthly(?:\s+breakdown)?|per\s+month|"
+            r"\bmom\b|\bmonths?\b"
             r")\b",
             text,
             re.IGNORECASE,
         )
     )
-    has_specific_month = bool(
-        re.search(rf"\b({_CALENDAR_MONTHS})\b", text, re.IGNORECASE)
-    )
-    # A month range is not a "single month" exclusion from year totals.
+
+    # Year (2026 / for 26 / this year / "year") or bare month-breakdown wording
+    # without a single named month → full calendar year, one row per month.
+    if (year is not None or mentions_year_word or mentions_month_breakdown) and not month_named:
+        y = year or today.year
+        if re.search(r"\bthis\s+year\b", text, re.IGNORECASE):
+            y = today.year
+        return f"{y}-01-01", f"{y + 1}-01-01"
+
+    if not month_named:
+        if re.search(r"\bthis\s+month\b", text, re.IGNORECASE):
+            return extract_month_year_bounds(question)
+        return extract_month_year_bounds(question)
+
+    return extract_month_year_bounds(question)
+
+
+def wants_month_breakdown(question):
+    """
+    True when results should be one row per calendar month.
+    Any mention of month, year, a calendar year, or a named month triggers this.
+    """
+    text = question or ""
+    if not text.strip():
+        return False
+
     if extract_month_range_bounds(text):
-        has_specific_month = False
-    return bool(has_year and has_hours and not has_specific_month)
+        return True
+
+    if extract_year_from_question(text) is not None:
+        return True
+
+    if re.search(
+        r"\b("
+        r"months?|monthly|years?|yearly|"
+        r"this\s+month|this\s+year|last\s+month|last\s+year|"
+        r"month\s*by\s*month|month\s*to\s*month|month\s+over\s+month|"
+        r"by\s+month|each\s+month|per\s+month|\bmom\b"
+        r")\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return True
+
+    if re.search(rf"\b({_CALENDAR_MONTHS})\b", text, re.IGNORECASE):
+        return True
+
+    return False
 
 
 def prior_question_text(history=None, last_result=None):
