@@ -961,14 +961,16 @@ def _datavista_recruiter_filter(name, confirmed_employee_id=None):
 def _recruiting_period_bounds(question):
     """Month/year when named; otherwise current calendar year for open-ended lists."""
     text = question or ""
-    has_period = bool(
-        re.search(
-            rf"\b({_CALENDAR_MONTHS}|20\d{{2}}|this\s+month|this\s+year|last\s+month)\b",
-            text,
-            re.IGNORECASE,
-        )
+    month_named = bool(
+        re.search(rf"\b({_CALENDAR_MONTHS})\b", text, re.IGNORECASE)
     )
-    if has_period:
+    year = extract_year_from_question(text)
+    if year is not None and not month_named:
+        return f"{year}-01-01", f"{year + 1}-01-01"
+    if re.search(r"\bthis\s+year\b", text, re.IGNORECASE) and not month_named:
+        y = date.today().year
+        return f"{y}-01-01", f"{y + 1}-01-01"
+    if month_named or re.search(r"\bthis\s+month|last\s+month\b", text, re.IGNORECASE):
         return extract_period_bounds(question)
     y = date.today().year
     return f"{y}-01-01", f"{y + 1}-01-01"
@@ -980,8 +982,9 @@ def build_datavista_stage_counts_sql(
     confirmed_employee_id=None,
 ):
     """
-    Deterministic one-row COUNT columns for multi-stage recruiting asks
-    (e.g. interviews + hires + submits) — avoids LLM 42000 syntax errors.
+    Deterministic COUNT columns for multi-stage recruiting asks
+    (e.g. hires + interviews + submits), in ask order.
+    Month-by-month when requested — avoids LLM 42000 syntax errors.
     """
     stages = requested_datavista_stages(question)
     if len(stages) < 2:
@@ -998,11 +1001,49 @@ def build_datavista_stage_counts_sql(
     datavista_db = get_datavista_database_name()
     recruiter_filter, _, _ = _datavista_recruiter_filter(name, confirmed_employee_id)
 
+    if wants_month_breakdown(question):
+        # One row per month; metric columns in ask order after month.
+        union_parts = []
+        for stage in stages:
+            table, date_col = _STAGE_TABLE_DATE[stage]
+            if stage == "rejects":
+                date_expr = (
+                    "COALESCE(TRY_CONVERT(date, INTERNALREJECTDATE), "
+                    "TRY_CONVERT(date, EXTERNALREJECTDATE))"
+                )
+            else:
+                date_expr = f"TRY_CONVERT(date, {date_col})"
+            count_cols = []
+            for s in stages:
+                count_cols.append("COUNT(*)" if s == stage else "0")
+            select_counts = ", ".join(
+                f"{expr} AS {s}" for s, expr in zip(stages, count_cols)
+            )
+            union_parts.append(
+                f"SELECT DATENAME(month, {date_expr}) AS month, "
+                f"MONTH({date_expr}) AS _month_num, "
+                f"YEAR({date_expr}) AS _year_num, "
+                f"{select_counts} "
+                f"FROM [{datavista_db}].[dbo].[{table}] "
+                f"WHERE {date_expr} >= '{start_iso}' AND {date_expr} < '{end_iso}' "
+                f"AND {recruiter_filter} "
+                f"GROUP BY DATENAME(month, {date_expr}), MONTH({date_expr}), YEAR({date_expr})"
+            )
+        sum_cols = ", ".join(f"SUM({s}) AS {s}" for s in stages)
+        return (
+            "SELECT month, "
+            + sum_cols
+            + " FROM ("
+            + " UNION ALL ".join(union_parts)
+            + ") AS stage_months "
+            "GROUP BY month, _month_num, _year_num "
+            "ORDER BY _year_num, _month_num"
+        )
+
     select_parts = []
     for stage in stages:
         table, date_col = _STAGE_TABLE_DATE[stage]
         if stage == "rejects":
-            # Rejects can be internal or external date.
             date_pred = (
                 f"("
                 f"(TRY_CONVERT(date, INTERNALREJECTDATE) >= '{start_iso}' "
@@ -2560,7 +2601,11 @@ def _friendly_display_name(col_name, bucket=None, question=None):
 
 
 def order_result_columns(results, question=None):
-    """Date/month leftmost, then logged hours / time metrics, then ask-order, then rest."""
+    """
+    Column 1 = month or day/date when present.
+    Then metrics in the exact order asked in the question.
+    Then identity / leftover columns.
+    """
     if not results:
         return results
 
@@ -2587,39 +2632,27 @@ def order_result_columns(results, question=None):
             preferred.append(key)
             seen.add(key)
 
-    # HARD RULE: month or day/date is always column 1.
+    # 1) Month or day/date always first.
     for key in month_keys:
         _add(key)
     for key in date_keys:
         _add(key)
 
-    # Time metrics next — logged hours first, then other time fields in ask order.
-    time_metrics = ("logged_hours", "avg_logged_hours", "break", "avg_break")
-    for metric in time_metrics:
-        if metric in metric_order or metric == "logged_hours":
-            for key in keys:
-                if _metric_bucket_for_column(key) == metric:
-                    _add(key)
-    for metric in metric_order:
-        if metric in time_metrics:
-            for key in keys:
-                if _metric_bucket_for_column(key) == metric:
-                    _add(key)
-
-    # Remaining metrics in the order asked.
+    # 2) Metrics in the order the user asked (hires → interviews → submittals, etc.).
     for metric in metric_order:
         for key in keys:
             if _metric_bucket_for_column(key) == metric:
                 _add(key)
 
+    # 3) Common leftovers (only if not already placed by ask-order).
     for name in (
-        "logged_hours",
-        "total_break",
-        "avg_logged_hours",
-        "avg_break",
         "userName",
         "username",
         "employeeid",
+        "logged_hours",
+        "avg_logged_hours",
+        "total_break",
+        "avg_break",
         "present_days",
         "halfday_days",
         "absent_days",
@@ -2629,6 +2662,7 @@ def order_result_columns(results, question=None):
         "offers",
         "starts",
         "rejects",
+        "session_count",
     ):
         for key in keys:
             if key.lower() == name.lower():
@@ -2639,7 +2673,6 @@ def order_result_columns(results, question=None):
             continue
         _add(key)
 
-    # Final safety: if month/date exists but somehow isn't first, force it.
     lead = month_keys[0] if month_keys else (date_keys[0] if date_keys else None)
     if lead and preferred and preferred[0] != lead:
         preferred = [lead] + [k for k in preferred if k != lead]
@@ -2648,6 +2681,14 @@ def order_result_columns(results, question=None):
     for row in results:
         ordered_rows.append({key: row.get(key) for key in preferred if key in row})
     return ordered_rows
+
+
+def result_column_order(results, question=None):
+    """Ordered column names for the UI (month/date first, then ask order)."""
+    if not results:
+        return []
+    ordered = order_result_columns(results, question)
+    return list(ordered[0].keys()) if ordered else []
 
 
 def enrich_duration_results(results, question=None):
@@ -5627,12 +5668,14 @@ def ask_question():
             duration_hint=duration_hint,
         )
         chart_type = recommend_chart(results, chart_type, question)
+        columns = result_column_order(results, question)
 
         return jsonify(
             {
                 "query": sql_query,
                 "answer": answer,
                 "data": results,
+                "column_order": columns,
                 "chart_type": chart_type,
                 "total_rows": len(results),
                 "domain": domain,

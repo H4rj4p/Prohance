@@ -682,8 +682,8 @@
       chartInstances.set(canvasId, chart);
     }
 
-    function orderTableColumns(columns) {
-      // Hard rule: month or day/date is always the first column in the UI.
+    function orderTableColumns(columns, preferredOrder = null) {
+      // Hard rule: month or day/date first, then ask-order from the server when given.
       const norm = (name) => String(name || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
       const isMonth = (name) => {
         const key = norm(name);
@@ -693,6 +693,26 @@
         const key = norm(name);
         return key === "sessiondate" || key === "date" || key === "workdate" || key === "day";
       };
+
+      if (Array.isArray(preferredOrder) && preferredOrder.length > 0) {
+        const available = new Set(columns);
+        const ordered = [];
+        preferredOrder.forEach(col => {
+          if (available.has(col)) {
+            ordered.push(col);
+            available.delete(col);
+          }
+        });
+        columns.forEach(col => {
+          if (available.has(col)) ordered.push(col);
+        });
+        // Safety: month/date first even if preferredOrder was wrong.
+        const monthCols = ordered.filter(isMonth);
+        const dateCols = ordered.filter(isDate);
+        const rest = ordered.filter(col => !isMonth(col) && !isDate(col));
+        return [...monthCols, ...dateCols, ...rest];
+      }
+
       const monthCols = columns.filter(isMonth);
       const dateCols = columns.filter(isDate);
       const rest = columns.filter(col => !isMonth(col) && !isDate(col));
@@ -708,10 +728,10 @@
       }).join("");
     }
 
-    function renderDataView(rows, isHidden = false) {
+    function renderDataView(rows, isHidden = false, preferredOrder = null) {
       if (!rows || rows.length === 0) return "";
 
-      const columns = orderTableColumns(Object.keys(rows[0]));
+      const columns = orderTableColumns(Object.keys(rows[0]), preferredOrder);
       if (columns.length === 0) return "";
 
       const header = columns.map(col =>
@@ -852,10 +872,10 @@
       URL.revokeObjectURL(url);
     }
 
-    function exportRowsAsCsv(rows) {
+    function exportRowsAsCsv(rows, preferredOrder = null) {
       if (!rows || rows.length === 0) return;
 
-      const columns = orderTableColumns(Object.keys(rows[0]));
+      const columns = orderTableColumns(Object.keys(rows[0]), preferredOrder);
       const escapeCsv = value => {
         const text = formatCellValue(value);
         return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
@@ -868,14 +888,16 @@
       downloadFile("iri-ai-results.csv", lines.join("\n"), "text/csv;charset=utf-8");
     }
 
-    function loadMoreRows(row, rows) {
+    function loadMoreRows(row, rows, preferredOrder = null) {
       const tableResult = row.querySelector(".table-result");
       const tbody = tableResult?.querySelector("tbody");
       const countEl = tableResult?.querySelector(".table-count");
       const button = tableResult?.querySelector('[data-action="load-more"]');
       if (!tableResult || !tbody || !countEl) return;
 
-      const columns = rows && rows.length > 0 ? orderTableColumns(Object.keys(rows[0])) : [];
+      const columns = rows && rows.length > 0
+        ? orderTableColumns(Object.keys(rows[0]), preferredOrder)
+        : [];
       const current = Number(tableResult.dataset.visibleCount || "0");
       const next = Math.min(current + TABLE_PAGE_SIZE, rows.length);
       tbody.innerHTML = renderTableRows(rows, columns, next);
@@ -952,6 +974,7 @@
       const confirmHtml = options.needsConfirmation
         ? renderConfirmButtons(options.candidates, options.originalQuestion)
         : "";
+      const preferredOrder = Array.isArray(options.columnOrder) ? options.columnOrder : null;
 
       const resolvedChartType = options.needsConfirmation
         ? null
@@ -961,7 +984,7 @@
       const closedActionHtml = chartId ? renderClosedChartToggle(chartId, rows) : "";
       const chartFooterHtml = chartId ? renderChartFooter(chartId, chartSpec?.type || null, rows) : "";
       const chartHtml = chartId ? renderChartCanvas(chartId, false, chartFooterHtml) : "";
-      const tableHtml = renderDataView(rows, false);
+      const tableHtml = renderDataView(rows, false, preferredOrder);
       const detailsHtml = renderDetails(query, rows);
 
       row.innerHTML = `
@@ -1008,12 +1031,12 @@
           }
 
           if (action === "csv") {
-            exportRowsAsCsv(rows);
+            exportRowsAsCsv(rows, preferredOrder);
             return;
           }
 
           if (action === "load-more") {
-            loadMoreRows(row, rows);
+            loadMoreRows(row, rows, preferredOrder);
             return;
           }
         });
@@ -1159,7 +1182,8 @@
             data.query || "",
             {
               chartType: data.chart_type || "table",
-              question: text
+              question: text,
+              columnOrder: data.column_order || null
             }
           );
           return;
@@ -1174,7 +1198,8 @@
             candidates: data.candidates || [],
             originalQuestion: text,
             question: text,
-            chartType: data.chart_type || "table"
+            chartType: data.chart_type || "table",
+            columnOrder: data.column_order || null
           }
         );
       } catch (err) {
