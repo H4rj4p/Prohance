@@ -5131,10 +5131,17 @@ def resolve_period_bounds(question, history=None, last_result=None):
     Period for the current ask, inheriting prior month-by-month / SQL bounds
     on follow-ups like "also show logged hours".
     "monthly" / "month by month" on this turn → full calendar year (not this month).
+    A single named month (July) on this turn → that month only.
     """
     text = question or ""
-    # Explicit range / year / month on this turn wins.
-    if extract_month_range_bounds(text) or extract_year_from_question(text) is not None:
+    # Explicit range on this turn wins.
+    if extract_month_range_bounds(text):
+        return extract_period_bounds(text)
+    # "July" / "logged hours for July" → July only (never expand to the full year).
+    if is_single_named_month_ask(text):
+        return extract_period_bounds(text)
+    # Bare year / year+month phrasing on this turn.
+    if extract_year_from_question(text) is not None:
         return extract_period_bounds(text)
     if re.search(
         rf"\b({_CALENDAR_MONTHS}|this\s+year|this\s+month|last\s+month)\b",
