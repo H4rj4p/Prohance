@@ -4325,6 +4325,14 @@ def ask_question():
                 }
             )
 
+        if not confirmed_username and is_hours_followup_question(
+            question, history, last_result
+        ):
+            confirmed_username = (
+                _person_from_history_questions(history)
+                or _extract_username_from_sql(sql_query)
+            )
+
         answer, chart_type = generate_answer(
             question,
             history,
