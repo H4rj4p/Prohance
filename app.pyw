@@ -988,33 +988,58 @@ def build_datavista_stage_counts_sql(
     question,
     confirmed_username=None,
     confirmed_employee_id=None,
+    history=None,
+    last_result=None,
 ):
     """
     Deterministic COUNT columns for multi-stage recruiting asks
     (e.g. hires + interviews + submits), in ask order.
     Month-by-month when requested — avoids LLM 42000 syntax errors.
+    Follow-ups like "monthly for 26" / "month by month" inherit prior stages.
     """
     stages = requested_datavista_stages(question)
-    if len(stages) < 2:
+    prior_q = prior_question_text(history, last_result)
+    if len(stages) < 1 and prior_q and (
+        is_continuation_followup(question)
+        or effective_wants_month_breakdown(question, history, last_result)
+    ):
+        stages = requested_datavista_stages(prior_q)
+
+    month_mode = effective_wants_month_breakdown(
+        question, history=history, last_result=last_result
+    )
+    # Month-by-month: one stage is enough. Totals still need 2+ stages.
+    if month_mode:
+        if len(stages) < 1:
+            return None
+    elif len(stages) < 2:
         return None
 
     name = (confirmed_username or "").strip()
     if not name:
         hints = extract_name_hints(question)
-        if not hints:
-            return None
-        name = " ".join(hints)
+        if not hints and prior_q:
+            hints = extract_name_hints(prior_q)
+        if hints:
+            name = " ".join(hints)
+    if not name:
+        name = _person_from_history_questions(history) or _extract_username_from_sql(
+            _prior_sql_from_context(history, last_result)
+        )
+    if not name:
+        return None
 
     start_iso, end_iso = _recruiting_period_bounds(question)
     # Follow-ups / month-by-month: inherit or force the right period.
-    if effective_wants_month_breakdown(question):
-        # Prefer explicit range/year on this turn via extract_period_bounds.
-        start_iso, end_iso = extract_period_bounds(question)
+    if month_mode:
+        start_iso, end_iso = resolve_period_bounds(
+            question, history=history, last_result=last_result
+        )
 
     datavista_db = get_datavista_database_name()
     recruiter_filter, _, _ = _datavista_recruiter_filter(name, confirmed_employee_id)
 
-    if effective_wants_month_breakdown(question):
+    if month_mode:
         # One row per month; metric columns in ask order after month.
         union_parts = []
         for stage in stages:
@@ -4469,11 +4494,14 @@ def is_continuation_followup(question):
         re.IGNORECASE,
     ):
         return True
-    # Metric-only follow-up with no new person name.
+    # Metric-only / period-only follow-up with no new person name.
+    # "monthly for 26", "month by month", "for 2026" keep prior stages/person.
     if not extract_name_hints(text) and re.search(
         r"\b(avg|average|total|sum|excluding|exclude|weekend|weekday|"
-        r"logged\s*hours?|month\s+by\s+month|by\s+month|break|information|"
-        r"same|those|that)\b",
+        r"logged\s*hours?|month\s+by\s+month|month\s*to\s*month|"
+        r"by\s+month|each\s+month|per\s+month|monthly|months?|"
+        r"years?|yearly|\bmom\b|break|information|same|those|that|"
+        r"for\s+(?:20\d{2}|'?\d{2})|in\s+(?:20\d{2}|'?\d{2}))\b",
         text,
         re.IGNORECASE,
     ):
@@ -4899,19 +4927,40 @@ _CALENDAR_MONTHS = (
 def extract_year_from_question(question, default=None):
     """
     Parse a year from the question.
-    Accepts 2026, '26, for 26, in 26, year 26 → 2026.
+    Accepts 2026, '26, for 26, in 26, year 26, monthly 26 → 2026.
     """
     text = question or ""
     match = re.search(r"\b(20\d{2})\b", text)
     if match:
         return int(match.group(1))
     match = re.search(
-        r"\b(?:for|in|of|year|during)\s+'?(\d{2})\b",
+        r"\b(?:for|in|of|year|during|monthly|month\s*by\s*month|"
+        r"by\s+month|per\s+month|each\s+month)\s+'?(\d{2})\b",
         text,
         re.IGNORECASE,
     )
     if match:
         return 2000 + int(match.group(1))
+    # "26 monthly" / "26 month by month"
+    match = re.search(
+        r"\b'?(\d{2})\s+(?:monthly|month\s*by\s*month|by\s+month|per\s+month)\b",
+        text,
+        re.IGNORECASE,
+    )
+    if match:
+        return 2000 + int(match.group(1))
+    # Bare two-digit year when the ask is clearly monthly / month-by-month.
+    if re.search(
+        r"\b(monthly|month\s*by\s*month|by\s+month|per\s+month|each\s+month|\bmom\b)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        match = re.search(r"(?<!\d)(\d{2})(?!\d)", text)
+        if match:
+            yy = int(match.group(1))
+            # Avoid day-of-month noise (01-31) unless phrased as a year ask.
+            if yy >= 20 or re.search(r"\b(?:for|in|of|year)\b", text, re.I):
+                return 2000 + yy
     match = re.search(r"'(\d{2})\b", text)
     if match:
         return 2000 + int(match.group(1))
@@ -5048,6 +5097,7 @@ def resolve_period_bounds(question, history=None, last_result=None):
     """
     Period for the current ask, inheriting prior month-by-month / SQL bounds
     on follow-ups like "also show logged hours".
+    "monthly" / "month by month" on this turn → full calendar year (not this month).
     """
     text = question or ""
     # Explicit range / year / month on this turn wins.
@@ -5060,6 +5110,18 @@ def resolve_period_bounds(question, history=None, last_result=None):
     ) and not is_continuation_followup(text):
         return extract_period_bounds(text)
 
+    # This turn asks for monthly / month-by-month without a single named month
+    # → full year. Do NOT inherit a prior default of "this month" only.
+    month_named = bool(
+        re.search(rf"\b({_CALENDAR_MONTHS})\b", text, re.IGNORECASE)
+    )
+    if (
+        wants_month_breakdown(text)
+        and not month_named
+        and not re.search(r"\bthis\s+month\b", text, re.IGNORECASE)
+    ):
+        return extract_period_bounds(text)
+
     if is_continuation_followup(text) or effective_wants_month_breakdown(
         text, history, last_result
     ):
@@ -5068,7 +5130,9 @@ def resolve_period_bounds(question, history=None, last_result=None):
         if bounds:
             return bounds
         prior_q = prior_question_text(history, last_result)
-        if prior_q:
+        if prior_q and wants_month_breakdown(prior_q):
+            return extract_period_bounds(prior_q)
+        if prior_q and not wants_month_breakdown(text):
             return extract_period_bounds(prior_q)
 
     if effective_wants_month_breakdown(text, history, last_result):
@@ -5862,6 +5926,8 @@ def ask_question():
                 question,
                 confirmed_username=confirmed_username,
                 confirmed_employee_id=confirmed_employee_id,
+                history=history,
+                last_result=last_result,
             )
         if not sql_query:
             sql_query = build_month_breakdown_with_hours_followup_sql(
