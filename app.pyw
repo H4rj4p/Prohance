@@ -23,6 +23,13 @@ BASE_DIR = Path(__file__).resolve().parent
 MEMORY_ROWS = 500
 
 app = Flask(__name__)
+# Keep response dict key order (month/date leftmost). Default True sorts
+# alphabetically so avg_logged_hours would appear before month.
+app.config["JSON_SORT_KEYS"] = False
+try:
+    app.json.sort_keys = False
+except Exception:
+    pass
 
 
 def load_local_settings():
@@ -2562,13 +2569,14 @@ def order_result_columns(results, question=None):
     month_keys = [
         k
         for k in keys
-        if _metric_bucket_for_column(k) == "month" or _norm_col(k) == "month"
+        if _metric_bucket_for_column(k) == "month"
+        or _norm_col(k) in {"month", "monthname", "mon"}
     ]
     date_keys = [
         k
         for k in keys
         if _metric_bucket_for_column(k) == "date"
-        or _norm_col(k) in {"sessiondate", "date", "workdate"}
+        or _norm_col(k) in {"sessiondate", "date", "workdate", "day"}
     ]
 
     preferred = []
@@ -2579,7 +2587,7 @@ def order_result_columns(results, question=None):
             preferred.append(key)
             seen.add(key)
 
-    # Date or month always on the far left.
+    # HARD RULE: month or day/date is always column 1.
     for key in month_keys:
         _add(key)
     for key in date_keys:
@@ -2630,6 +2638,11 @@ def order_result_columns(results, question=None):
         if _norm_col(key) == "duration":
             continue
         _add(key)
+
+    # Final safety: if month/date exists but somehow isn't first, force it.
+    lead = month_keys[0] if month_keys else (date_keys[0] if date_keys else None)
+    if lead and preferred and preferred[0] != lead:
+        preferred = [lead] + [k for k in preferred if k != lead]
 
     ordered_rows = []
     for row in results:
@@ -4550,8 +4563,16 @@ def build_month_breakdown_hours_sql(
 
     start_iso, end_iso = extract_period_bounds(question)
     # Month-by-month with no year/month named → full current year, not just this month.
-    if not re.search(
-        rf"\b({_CALENDAR_MONTHS}|20\d{{2}}|this\s+year|last\s+year|this\s+month)\b",
+    year = extract_year_from_question(question)
+    if year is not None and not re.search(
+        rf"\b({_CALENDAR_MONTHS}|this\s+month)\b",
+        question or "",
+        re.IGNORECASE,
+    ):
+        start_iso, end_iso = f"{year}-01-01", f"{year + 1}-01-01"
+    elif not re.search(
+        rf"\b({_CALENDAR_MONTHS}|20\d{{2}}|this\s+year|last\s+year|this\s+month|"
+        rf"(?:for|in|of|year)\s+'?\d{{2}})\b",
         question or "",
         re.IGNORECASE,
     ):
@@ -4595,6 +4616,28 @@ _CALENDAR_MONTHS = (
 )
 
 
+def extract_year_from_question(question, default=None):
+    """
+    Parse a year from the question.
+    Accepts 2026, '26, for 26, in 26, year 26 → 2026.
+    """
+    text = question or ""
+    match = re.search(r"\b(20\d{2})\b", text)
+    if match:
+        return int(match.group(1))
+    match = re.search(
+        r"\b(?:for|in|of|year|during)\s+'?(\d{2})\b",
+        text,
+        re.IGNORECASE,
+    )
+    if match:
+        return 2000 + int(match.group(1))
+    match = re.search(r"'(\d{2})\b", text)
+    if match:
+        return 2000 + int(match.group(1))
+    return default
+
+
 def extract_period_bounds(question):
     """
     Return (start_iso, end_iso) for a named month, full year, or this month.
@@ -4609,10 +4652,9 @@ def extract_period_bounds(question):
         if re.search(r"\bthis\s+year\b", text, re.IGNORECASE):
             y = today.year
             return f"{y}-01-01", f"{y + 1}-01-01"
-        year_match = re.search(r"\b(20\d{2})\b", text)
-        if year_match and not re.search(r"\bthis\s+month\b", text, re.IGNORECASE):
-            y = int(year_match.group(1))
-            return f"{y}-01-01", f"{y + 1}-01-01"
+        year = extract_year_from_question(text)
+        if year is not None and not re.search(r"\bthis\s+month\b", text, re.IGNORECASE):
+            return f"{year}-01-01", f"{year + 1}-01-01"
     return extract_month_year_bounds(question)
 
 
@@ -4629,8 +4671,11 @@ def wants_month_breakdown(question):
         re.IGNORECASE,
     ):
         return True
-    # "2026 total logged hours" / "total hours this year" → month-by-month
-    has_year = bool(re.search(r"\b(20\d{2}|this\s+year)\b", text, re.IGNORECASE))
+    # "2026 total logged hours" / "for 26" / "total hours this year" → month-by-month
+    has_year = bool(
+        extract_year_from_question(text) is not None
+        or re.search(r"\bthis\s+year\b", text, re.IGNORECASE)
+    )
     has_hours = bool(
         re.search(
             r"\b("

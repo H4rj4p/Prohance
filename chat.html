@@ -682,6 +682,23 @@
       chartInstances.set(canvasId, chart);
     }
 
+    function orderTableColumns(columns) {
+      // Hard rule: month or day/date is always the first column in the UI.
+      const norm = (name) => String(name || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+      const isMonth = (name) => {
+        const key = norm(name);
+        return key === "month" || key === "monthname" || key === "mon";
+      };
+      const isDate = (name) => {
+        const key = norm(name);
+        return key === "sessiondate" || key === "date" || key === "workdate" || key === "day";
+      };
+      const monthCols = columns.filter(isMonth);
+      const dateCols = columns.filter(isDate);
+      const rest = columns.filter(col => !isMonth(col) && !isDate(col));
+      return [...monthCols, ...dateCols, ...rest];
+    }
+
     function renderTableRows(rows, columns, visibleCount) {
       return rows.slice(0, visibleCount).map(row => {
         const cells = columns.map(col =>
@@ -694,7 +711,7 @@
     function renderDataView(rows, isHidden = false) {
       if (!rows || rows.length === 0) return "";
 
-      const columns = Object.keys(rows[0]);
+      const columns = orderTableColumns(Object.keys(rows[0]));
       if (columns.length === 0) return "";
 
       const header = columns.map(col =>
@@ -838,7 +855,7 @@
     function exportRowsAsCsv(rows) {
       if (!rows || rows.length === 0) return;
 
-      const columns = Object.keys(rows[0]);
+      const columns = orderTableColumns(Object.keys(rows[0]));
       const escapeCsv = value => {
         const text = formatCellValue(value);
         return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
@@ -858,7 +875,7 @@
       const button = tableResult?.querySelector('[data-action="load-more"]');
       if (!tableResult || !tbody || !countEl) return;
 
-      const columns = rows && rows.length > 0 ? Object.keys(rows[0]) : [];
+      const columns = rows && rows.length > 0 ? orderTableColumns(Object.keys(rows[0])) : [];
       const current = Number(tableResult.dataset.visibleCount || "0");
       const next = Math.min(current + TABLE_PAGE_SIZE, rows.length);
       tbody.innerHTML = renderTableRows(rows, columns, next);
