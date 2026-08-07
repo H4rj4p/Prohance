@@ -1055,7 +1055,11 @@
       // do not attach the previous person's result context unless comparing / continuing.
       const q = String(text || "");
       if (/\b(compare|versus|vs\.?|both|difference between)\b/i.test(q)) return false;
-      if (/^\s*(and|also|plus|what about|how about|excluding|exclude)\b/i.test(q)) return false;
+      if (/^\s*(and|also|plus|now|then|what about|how about|excluding|exclude|without|except)\b/i.test(q)) return false;
+      if (/\b(exclud(?:e|ing|ed)|without|except|omit|remove|skip)\b/i.test(q)
+          && /\b(weekend|weekends|weekday|weekdays|monday|tuesday|wednesday|thursday|friday|saturday|sunday)s?\b/i.test(q)) {
+        return false;
+      }
       if (/\b(he|she|they|them|his|her|their|him|this user|same person)\b/i.test(q)) {
         return false;
       }

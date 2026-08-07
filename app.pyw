@@ -367,12 +367,13 @@ def get_datavista_database_name():
     return (os.environ.get("DataVistaDatabase") or "DataVista").strip() or "DataVista"
 
 
-def detect_question_domain(question):
+def detect_question_domain(question, history=None, last_result=None):
     """
     Route questions to Prohance (attendance/time) or DataVista (recruiting).
 
     Prohance is ONLY for logged hours, breaks, AAFS, login/logout, attendance.
     Submits, pay rates, start/placement dates, clients, candidates → DataVista.
+    Continuation follow-ups ("excluding Fridays", "and avg") inherit the prior domain.
     When unsure, prefer DataVista (not Prohance).
     """
     text = question or ""
@@ -405,8 +406,73 @@ def detect_question_domain(question):
     if has_datavista:
         return "datavista"
 
+    # "excluding Fridays" / "and avg" have no domain keywords — stay on prior domain.
+    if is_continuation_followup(question):
+        inherited = infer_domain_from_context(history, last_result)
+        if inherited:
+            return inherited
+
     # Default: DataVista for non-attendance questions.
     return "datavista"
+
+
+def infer_domain_from_context(history=None, last_result=None):
+    """Infer Prohance vs DataVista from prior SQL / question when the follow-up is bare."""
+    chunks = []
+    if isinstance(last_result, dict):
+        chunks.append(str(last_result.get("query") or ""))
+        chunks.append(str(last_result.get("question") or ""))
+        chunks.append(str(last_result.get("answer") or ""))
+    for item in reversed(history or []):
+        chunks.append(str(item.get("content") or ""))
+        if len(chunks) >= 10:
+            break
+    blob = "\n".join(chunks)
+    if not blob.strip():
+        return None
+
+    has_attendance = bool(
+        re.search(
+            r"\b(sessionDate|logged_hours|userName|EmployeeAttendance|"
+            r"avg_logged|total_seconds|avg_seconds)\b",
+            blob,
+            re.IGNORECASE,
+        )
+    )
+    has_recruiting = bool(
+        re.search(
+            r"\bCR_(?:Submittal|Interview|Hire|Reject)Master\b|"
+            r"\b(SUBMITTALDATE|INTERVIEWDATE|PLACEMENTDATE|PRIMARYRECRUITERNAME)\b",
+            blob,
+            re.IGNORECASE,
+        )
+    )
+    if has_attendance and not has_recruiting:
+        return "prohance"
+    if has_recruiting and not has_attendance:
+        return "datavista"
+    if has_attendance:
+        # Mixed performance → exclusions on hours still need Prohance for hour filters;
+        # day-exclusion follow-ups after hours questions are Prohance.
+        if re.search(
+            r"\b(logged|hours?|sessionDate|avg_logged|total_seconds)\b",
+            blob,
+            re.IGNORECASE,
+        ):
+            return "prohance"
+        return "datavista"
+
+    # Fall back to keyword domain of the most recent user question.
+    for item in reversed(history or []):
+        if str(item.get("role") or "").lower() != "user":
+            continue
+        prior = str(item.get("content") or "")
+        if DATAVISTA_PATTERN.search(prior) and not PROHANCE_PATTERN.search(prior):
+            return "datavista"
+        if PROHANCE_PATTERN.search(prior):
+            return "prohance"
+        break
+    return None
 
 
 def get_datavista_schema_text():
@@ -776,9 +842,10 @@ def normalize_user_question(question):
     return re.sub(r"\s+", " ", text).strip()
 
 
-def enhance_for_sql(question):
+def enhance_for_sql(question, history=None, domain=None):
     notes = []
     text = question or ""
+    active_domain = domain or detect_question_domain(question, history=history)
 
     if is_multi_part(question):
         notes.append(
@@ -809,7 +876,7 @@ def enhance_for_sql(question):
             "return total_seconds only (no TIME convert)."
         )
 
-    if detect_question_domain(question) == "datavista":
+    if active_domain == "datavista":
         notes.append(datavista_table_guidance(question))
 
     if re.search(r"\bthis\s+month\b", text, re.IGNORECASE):
@@ -827,16 +894,18 @@ def enhance_for_sql(question):
     if month_note:
         notes.append(month_note)
 
-    exclude_note = exclusion_sql_guidance(question)
+    exclude_note = exclusion_sql_guidance(question, history=history)
     if exclude_note:
         notes.append(exclude_note)
 
     if is_continuation_followup(question):
         notes.append(
             "FOLLOW-UP: Keep all filters from the previous question "
-            "(person, date range, thresholds like > 9 hours, exclusions). "
+            "(person, date range, thresholds like > 9 hours, day exclusions). "
             "Only change what the user newly asked for (e.g. average instead of list, "
-            "or add an excluding-weekends filter)."
+            "or ADD newly excluded weekdays on top of earlier exclusions). "
+            "If weekends were already excluded and the user now excludes Fridays, "
+            "keep Saturday/Sunday out AND also exclude Friday."
         )
 
     # Mixed recruiting + attendance performance questions.
@@ -889,6 +958,19 @@ def enhance_for_answer(question):
         base += (
             " If the data is month-by-month, use month NAMES (January, February, ...) "
             "and cover every month present in the data, not only the first few."
+        )
+    if exclusion_sql_guidance(question) or (
+        is_continuation_followup(question)
+        and re.search(
+            r"\b(exclud|without|except|weekend|weekday|friday|saturday|sunday)\b",
+            question or "",
+            re.IGNORECASE,
+        )
+    ):
+        base += (
+            " This is a filter follow-up. Report the same metric with the exclusion applied. "
+            "Do NOT say you couldn't find Fridays/weekends as a field — those are day filters, "
+            "not data columns."
         )
     if not is_multi_part(question):
         return (question or "") + base
@@ -2757,13 +2839,22 @@ def resolve_recruiter_from_question(question, confirmed_username, confirmed_empl
     return finalize_name_matches(matches, hints)
 
 
-def resolve_person_from_question(question, primary_table, confirmed_username, confirmed_employee_id):
+def resolve_person_from_question(
+    question,
+    primary_table,
+    confirmed_username,
+    confirmed_employee_id,
+    domain=None,
+    history=None,
+    last_result=None,
+):
     """
     Resolve a named person in Prohance (employees) or DataVista (recruiters/users).
     DataVista never resolves candidate names — only recruiter/user names.
     Returns (username, id, matches, domain, status).
     """
-    domain = detect_question_domain(question)
+    if domain is None:
+        domain = detect_question_domain(question, history=history, last_result=last_result)
 
     if confirmed_username or confirmed_employee_id:
         if should_reuse_prior_person(question, confirmed_username, confirmed_employee_id):
@@ -3106,7 +3197,8 @@ def has_pronoun_person_followup(question):
 def is_continuation_followup(question):
     """
     Follow-ups that should keep prior filters/SQL context:
-    "and avg logged hours", "excluding weekends", "what about this month".
+    "and avg logged hours", "excluding weekends", "what about this month",
+    "now exclude Fridays", "without Fridays too".
     """
     text = (question or "").strip()
     if not text:
@@ -3114,7 +3206,21 @@ def is_continuation_followup(question):
     if is_comparison_question(text) or has_pronoun_person_followup(text):
         return True
     if re.match(
-        r"^\s*(and|also|plus|what\s+about|how\s+about|excluding|exclude)\b",
+        r"^\s*(and|also|plus|now|then|what\s+about|how\s+about|"
+        r"excluding|exclude|without|except)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return True
+    # Day / weekend exclusion follow-ups phrased mid-sentence.
+    if re.search(
+        r"\b(exclud(?:e|ing|ed)|without|except|omit|remove|skip)\b",
+        text,
+        re.IGNORECASE,
+    ) and re.search(
+        r"\b(weekend|weekends|weekday|weekdays|"
+        r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+        r"mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun)s?\b",
         text,
         re.IGNORECASE,
     ):
@@ -3130,53 +3236,94 @@ def is_continuation_followup(question):
     return False
 
 
-def exclusion_sql_guidance(question):
-    """Translate excluding weekends/weekdays/Monday into SQL DATENAME filters."""
-    text = (question or "").lower()
-    if not re.search(r"\b(exclud(?:e|ing|ed)|without|except)\b", text):
-        return None
+_DAY_NAME_MAP = {
+    "monday": "Monday",
+    "tuesday": "Tuesday",
+    "wednesday": "Wednesday",
+    "thursday": "Thursday",
+    "friday": "Friday",
+    "saturday": "Saturday",
+    "sunday": "Sunday",
+    "mon": "Monday",
+    "tue": "Tuesday",
+    "tues": "Tuesday",
+    "wed": "Wednesday",
+    "thu": "Thursday",
+    "thur": "Thursday",
+    "thurs": "Thursday",
+    "fri": "Friday",
+    "sat": "Saturday",
+    "sun": "Sunday",
+}
 
-    notes = [
-        "EXCLUSION FILTER: Use DATENAME(WEEKDAY, <date_column>) for day-of-week filters "
-        "(do not use DATEPART weekday numbers — they depend on DATEFIRST and are wrong)."
-    ]
-    if re.search(r"\bweekends?\b", text):
-        notes.append(
-            "Exclude weekends: AND DATENAME(WEEKDAY, <date>) NOT IN ('Saturday', 'Sunday')."
-        )
-    if re.search(r"\bweekdays?\b", text):
-        notes.append(
-            "Exclude weekdays: AND DATENAME(WEEKDAY, <date>) IN ('Saturday', 'Sunday')."
-        )
 
-    day_map = {
-        "monday": "Monday",
-        "tuesday": "Tuesday",
-        "wednesday": "Wednesday",
-        "thursday": "Thursday",
-        "friday": "Friday",
-        "saturday": "Saturday",
-        "sunday": "Sunday",
-        "mon": "Monday",
-        "tue": "Tuesday",
-        "tues": "Tuesday",
-        "wed": "Wednesday",
-        "thu": "Thursday",
-        "thur": "Thursday",
-        "thurs": "Thursday",
-        "fri": "Friday",
-        "sat": "Saturday",
-        "sun": "Sunday",
-    }
+def _extract_exclusion_flags(text):
+    """Return (exclude_weekends, exclude_weekdays, [day labels]) from one utterance."""
+    lowered = (text or "").lower()
+    if not re.search(r"\b(exclud(?:e|ing|ed)|without|except|omit|remove|skip)\b", lowered):
+        # Bare "weekends" in an excluding-style follow-up still counts when paired upstream.
+        if not re.search(r"\b(weekend|weekends|weekday|weekdays)\b", lowered):
+            return False, False, []
+
+    exclude_weekends = bool(re.search(r"\bweekends?\b", lowered))
+    exclude_weekdays = bool(re.search(r"\bweekdays?\b", lowered))
     excluded_days = []
-    for key, label in day_map.items():
-        if re.search(rf"\b{key}s?\b", text):
+    for key, label in _DAY_NAME_MAP.items():
+        if re.search(rf"\b{key}s?\b", lowered):
             if label not in excluded_days:
                 excluded_days.append(label)
+    return exclude_weekends, exclude_weekdays, excluded_days
+
+
+def exclusion_sql_guidance(question, history=None):
+    """Translate excluding weekends/weekdays/Monday into SQL DATENAME filters."""
+    texts = [question or ""]
+    # Stack exclusions across follow-ups (weekends, then later Fridays).
+    if is_continuation_followup(question) and history:
+        for item in history:
+            if str(item.get("role") or "").lower() != "user":
+                continue
+            prior = str(item.get("content") or "")
+            if re.search(
+                r"\b(exclud|without|except|omit|remove|skip|weekend|weekday|"
+                r"monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+                prior,
+                re.IGNORECASE,
+            ):
+                texts.append(prior)
+
+    exclude_weekends = False
+    exclude_weekdays = False
+    excluded_days = []
+    for text in texts:
+        wends, wdays, days = _extract_exclusion_flags(text)
+        exclude_weekends = exclude_weekends or wends
+        exclude_weekdays = exclude_weekdays or wdays
+        for day in days:
+            if day not in excluded_days:
+                excluded_days.append(day)
+
+    if not (exclude_weekends or exclude_weekdays or excluded_days):
+        return None
+
+    if exclude_weekends:
+        for day in ("Saturday", "Sunday"):
+            if day not in excluded_days:
+                excluded_days.append(day)
+
+    notes = [
+        "EXCLUSION FILTER: Use DATENAME(WEEKDAY, sessionDate) for day-of-week filters "
+        "(do not use DATEPART weekday numbers — they depend on DATEFIRST and are wrong)."
+    ]
+    if exclude_weekdays and not excluded_days:
+        notes.append(
+            "Exclude weekdays: AND DATENAME(WEEKDAY, sessionDate) IN ('Saturday', 'Sunday')."
+        )
     if excluded_days:
         listed = ", ".join(f"'{d}'" for d in excluded_days)
         notes.append(
-            f"Exclude named weekdays: AND DATENAME(WEEKDAY, <date>) NOT IN ({listed})."
+            f"Exclude these weekdays (combined from this and prior follow-ups): "
+            f"AND DATENAME(WEEKDAY, sessionDate) NOT IN ({listed})."
         )
     return " ".join(notes)
 
@@ -3217,12 +3364,15 @@ def names_refer_to_same_person(hints, full_name):
 
 def should_reuse_prior_person(question, confirmed_username=None, confirmed_employee_id=None):
     """
-    Keep a previously confirmed person only for pronoun follow-ups or comparisons.
+    Keep a previously confirmed person only for pronoun follow-ups, comparisons,
+    or metric/filter continuations ("and avg", "excluding Fridays").
     A newly named person replaces the old one.
     """
     if not (confirmed_username or confirmed_employee_id):
         return False
     if is_comparison_question(question):
+        return True
+    if is_continuation_followup(question) and not extract_name_hints(question):
         return True
     hints = extract_name_hints(question)
     if hints:
@@ -3292,7 +3442,7 @@ def generate_sql(
     domain="prohance",
 ):
     date_hint = current_date_context(domain=domain)
-    enhanced_question = enhance_for_sql(question)
+    enhanced_question = enhance_for_sql(question, history=history, domain=domain)
     prompt_question = format_for_prompt(
         enhanced_question,
         sanitize_history_for_question(question, history),
@@ -3617,7 +3767,7 @@ def ask_question():
             confirmed_employee_id = None
 
         primary_table = schema_provider.get_primary_table_name()
-        domain = detect_question_domain(question)
+        domain = detect_question_domain(question, history=history, last_result=last_result)
 
         # Prohance still needs a local table; DataVista uses three-part names on the same server.
         if domain == "prohance" and not primary_table:
@@ -3645,6 +3795,9 @@ def ask_question():
             primary_table,
             confirmed_username,
             confirmed_employee_id,
+            domain=domain,
+            history=history,
+            last_result=last_result,
         )
 
         if name_status == "not_found":
@@ -3773,6 +3926,9 @@ def ask_question():
         )
     except DATABASE_ERROR_TYPES as exc:
         detail = str(exc)
+        invalid_object = bool(
+            re.search(r"42S02|invalid object name", detail, re.IGNORECASE)
+        )
         if domain == "datavista":
             hint = (
                 "This looked like a DataVista (recruiting) question. "
@@ -3780,6 +3936,12 @@ def ask_question():
                 "and TRY_CONVERT(date, ...) for month filters. "
                 "Confirm the SQL login can read the DataVista database."
             )
+            if invalid_object:
+                hint += (
+                    " For mixed performance (submits + logged hours), do not invent a "
+                    "database named Prohance — use the connected attendance database/"
+                    "table three-part name from the schema notes."
+                )
         else:
             hint = (
                 "This looked like a Prohance (attendance/hours) question. "
@@ -3787,6 +3949,11 @@ def ask_question():
                 "and SUM of DATEDIFF(SECOND, ...) on logged_hours as total_seconds "
                 "(do not convert totals back to TIME — it wraps at 24 hours)."
             )
+            if invalid_object:
+                hint += (
+                    " Do not invent database/table names; use the connected database "
+                    "and the live attendance table from schema."
+                )
         return jsonify(
             {
                 "query": sql_query,
