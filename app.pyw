@@ -961,6 +961,9 @@ def _datavista_recruiter_filter(name, confirmed_employee_id=None):
 def _recruiting_period_bounds(question):
     """Month/year when named; otherwise current calendar year for open-ended lists."""
     text = question or ""
+    ranged = extract_month_range_bounds(text)
+    if ranged:
+        return ranged
     month_named = bool(
         re.search(rf"\b({_CALENDAR_MONTHS})\b", text, re.IGNORECASE)
     )
@@ -998,10 +1001,15 @@ def build_datavista_stage_counts_sql(
         name = " ".join(hints)
 
     start_iso, end_iso = _recruiting_period_bounds(question)
+    # Follow-ups / month-by-month: inherit or force the right period.
+    if effective_wants_month_breakdown(question):
+        # Prefer explicit range/year on this turn via extract_period_bounds.
+        start_iso, end_iso = extract_period_bounds(question)
+
     datavista_db = get_datavista_database_name()
     recruiter_filter, _, _ = _datavista_recruiter_filter(name, confirmed_employee_id)
 
-    if wants_month_breakdown(question):
+    if effective_wants_month_breakdown(question):
         # One row per month; metric columns in ask order after month.
         union_parts = []
         for stage in stages:
@@ -1065,58 +1073,242 @@ def build_datavista_stage_counts_sql(
     return "SELECT " + ", ".join(select_parts)
 
 
+def build_month_breakdown_with_hours_followup_sql(
+    question,
+    history=None,
+    last_result=None,
+    confirmed_username=None,
+    confirmed_employee_id=None,
+    primary_table=None,
+):
+    """
+    Follow-up like "also show logged hours" after a month-by-month ask.
+    Keeps prior months/year and prior stage columns, adds logged hours by month.
+    """
+    text = question or ""
+    if not is_continuation_followup(text):
+        return None
+    if not prior_wants_month_breakdown(history, last_result):
+        return None
+    if not re.search(r"\b(logged\s*hours?|\bhours?\b|avg|average)\b", text, re.I):
+        return None
+
+    prior_q = prior_question_text(history, last_result)
+    stages = requested_datavista_stages(text)
+    if len(stages) < 1:
+        stages = requested_datavista_stages(prior_q)
+    # If no recruiting stages in the thread, plain hours month-breakdown handles it.
+    if len(stages) < 1:
+        return None
+
+    name = (confirmed_username or "").strip()
+    if not name:
+        hints = extract_name_hints(text) or extract_name_hints(prior_q)
+        if hints:
+            name = " ".join(hints)
+    if not name:
+        name = _person_from_history_questions(history) or _extract_username_from_sql(
+            _prior_sql_from_context(history, last_result)
+        )
+    if not name:
+        return None
+
+    start_iso, end_iso = resolve_period_bounds(
+        text, history=history, last_result=last_result
+    )
+    datavista_db = get_datavista_database_name()
+    recruiter_filter, _, _ = _datavista_recruiter_filter(name, confirmed_employee_id)
+
+    table_name = primary_table or (
+        schema_provider.get_primary_table_name() if "schema_provider" in globals() else None
+    ) or "EmployeeAttendance"
+    db_name = get_connected_database_name()
+    attendance_from = f"[{db_name}].[dbo].[{table_name}]" if db_name else f"[{table_name}]"
+    safe_person = sql_literal(name)
+    first = sql_literal(name.split()[0]) if name.split() else safe_person
+    seconds_expr = (
+        "COALESCE(DATEDIFF(SECOND, 0, "
+        "TRY_CAST(NULLIF(LTRIM(RTRIM(logged_hours)), '') AS TIME)), 0)"
+    )
+    use_avg = bool(
+        re.search(r"\bavg(?:erage)?\b", text, re.I)
+        or re.search(r"\bavg(?:erage)?\b", prior_q or "", re.I)
+    )
+    hours_metric = (
+        f"CAST(ROUND(AVG({seconds_expr}), 0) AS int)"
+        if use_avg
+        else f"CAST(SUM({seconds_expr}) AS int)"
+    )
+    hours_alias = "avg_seconds" if use_avg else "total_seconds"
+
+    union_parts = []
+    for stage in stages:
+        table, date_col = _STAGE_TABLE_DATE[stage]
+        if stage == "rejects":
+            date_expr = (
+                "COALESCE(TRY_CONVERT(date, INTERNALREJECTDATE), "
+                "TRY_CONVERT(date, EXTERNALREJECTDATE))"
+            )
+        else:
+            date_expr = f"TRY_CONVERT(date, {date_col})"
+        count_cols = ["COUNT(*)" if s == stage else "0" for s in stages]
+        select_counts = ", ".join(f"{expr} AS {s}" for s, expr in zip(stages, count_cols))
+        union_parts.append(
+            f"SELECT DATENAME(month, {date_expr}) AS month, "
+            f"MONTH({date_expr}) AS _month_num, YEAR({date_expr}) AS _year_num, "
+            f"{select_counts} "
+            f"FROM [{datavista_db}].[dbo].[{table}] "
+            f"WHERE {date_expr} >= '{start_iso}' AND {date_expr} < '{end_iso}' "
+            f"AND {recruiter_filter} "
+            f"GROUP BY DATENAME(month, {date_expr}), MONTH({date_expr}), YEAR({date_expr})"
+        )
+
+    sum_cols = ", ".join(f"SUM(s.{stage}) AS {stage}" for stage in stages)
+    return (
+        "SELECT s.month, "
+        + sum_cols
+        + f", h.{hours_alias} AS {hours_alias} "
+        "FROM ("
+        + " UNION ALL ".join(union_parts)
+        + ") AS stage_rows s "
+        "LEFT JOIN ("
+        f"SELECT DATENAME(month, sessionDate) AS month, "
+        f"MONTH(sessionDate) AS _month_num, YEAR(sessionDate) AS _year_num, "
+        f"{hours_metric} AS {hours_alias} "
+        f"FROM {attendance_from} "
+        f"WHERE (userName = '{safe_person}' OR userName LIKE '{safe_person}%' "
+        f"OR userName LIKE '{first}%') "
+        f"AND sessionDate >= '{start_iso}' AND sessionDate < '{end_iso}' "
+        "GROUP BY DATENAME(month, sessionDate), MONTH(sessionDate), YEAR(sessionDate)"
+        ") AS h ON s._month_num = h._month_num AND s._year_num = h._year_num "
+        "GROUP BY s.month, s._month_num, s._year_num, "
+        f"h.{hours_alias} "
+        "ORDER BY s._year_num, s._month_num"
+    )
+
+
+_MONTH_NAME_TO_NUM = {
+    "january": 1,
+    "jan": 1,
+    "february": 2,
+    "feb": 2,
+    "march": 3,
+    "mar": 3,
+    "april": 4,
+    "apr": 4,
+    "may": 5,
+    "june": 6,
+    "jun": 6,
+    "july": 7,
+    "jul": 7,
+    "august": 8,
+    "aug": 8,
+    "september": 9,
+    "sep": 9,
+    "sept": 9,
+    "october": 10,
+    "oct": 10,
+    "november": 11,
+    "nov": 11,
+    "december": 12,
+    "dec": 12,
+}
+
+
+def _month_alt_pattern():
+    return "|".join(sorted(_MONTH_NAME_TO_NUM.keys(), key=len, reverse=True))
+
+
+def _add_months(year, month, delta):
+    """Return (year, month) after adding delta months (month is 1-12)."""
+    idx = year * 12 + (month - 1) + delta
+    return idx // 12, idx % 12 + 1
+
+
+def extract_month_range_bounds(question):
+    """
+    Inclusive month ranges:
+      "from January to February", "January till March", "Jan through March 2026"
+      "between January and March"
+    Returns (start_iso, end_iso) with end exclusive (day after last included month),
+    or None if no range is present.
+    Does NOT match "month to month".
+    """
+    text = question or ""
+    months = _month_alt_pattern()
+    year_default = date.today().year
+
+    patterns = [
+        # from January [2026] to/till/until/through February [2026]
+        rf"(?:from\s+)?({months})(?:\s+(\d{{4}}))?\s+"
+        rf"(?:to|till|until|through)\s+({months})(?:\s+(\d{{4}}))?",
+        # between January [2026] and March [2026]
+        rf"\bbetween\s+({months})(?:\s+(\d{{4}}))?\s+and\s+({months})(?:\s+(\d{{4}}))?",
+    ]
+    match = None
+    for pat in patterns:
+        match = re.search(pat, text, re.IGNORECASE)
+        if match:
+            break
+    if not match:
+        return None
+
+    start_name, start_year_s, end_name, end_year_s = match.groups()
+    start_month = _MONTH_NAME_TO_NUM[start_name.lower()]
+    end_month = _MONTH_NAME_TO_NUM[end_name.lower()]
+    start_year = int(start_year_s) if start_year_s else None
+    end_year = int(end_year_s) if end_year_s else None
+
+    # Bare year elsewhere in the question (e.g. "January to March for 2026")
+    loose_year = extract_year_from_question(text)
+    if start_year is None and end_year is None:
+        start_year = loose_year or year_default
+        end_year = start_year
+    elif start_year is None:
+        start_year = end_year
+    elif end_year is None:
+        end_year = start_year
+
+    # Cross-year shorthand: Nov to Feb with one year → end in next year
+    if end_year < start_year or (
+        end_year == start_year and end_month < start_month and not end_year_s and not start_year_s
+    ):
+        end_year = start_year + 1
+
+    start = date(start_year, start_month, 1)
+    end_y, end_m = _add_months(end_year, end_month, 1)
+    end = date(end_y, end_m, 1)
+    return start.isoformat(), end.isoformat()
+
+
 def extract_month_year_bounds(question):
     """Return (start_iso, end_iso) for a named month, or this month if none named."""
+    ranged = extract_month_range_bounds(question)
+    if ranged:
+        return ranged
+
     text = question or ""
     today = date.today()
-    month_lookup = {
-        "january": 1,
-        "jan": 1,
-        "february": 2,
-        "feb": 2,
-        "march": 3,
-        "mar": 3,
-        "april": 4,
-        "apr": 4,
-        "may": 5,
-        "june": 6,
-        "jun": 6,
-        "july": 7,
-        "jul": 7,
-        "august": 8,
-        "aug": 8,
-        "september": 9,
-        "sep": 9,
-        "sept": 9,
-        "october": 10,
-        "oct": 10,
-        "november": 11,
-        "nov": 11,
-        "december": 12,
-        "dec": 12,
-    }
-    months = "|".join(sorted(month_lookup.keys(), key=len, reverse=True))
+    months = _month_alt_pattern()
     year = today.year
     month = today.month
 
     match = re.search(rf"\b({months})\s+(\d{{4}})\b", text, re.IGNORECASE)
     if match:
-        month = month_lookup[match.group(1).lower()]
+        month = _MONTH_NAME_TO_NUM[match.group(1).lower()]
         year = int(match.group(2))
     else:
         match = re.search(rf"\b({months})\b", text, re.IGNORECASE)
         if match:
-            month = month_lookup[match.group(1).lower()]
-            year = today.year
+            month = _MONTH_NAME_TO_NUM[match.group(1).lower()]
+            year = extract_year_from_question(text) or today.year
         elif re.search(r"\bthis\s+month\b", text, re.IGNORECASE):
             month = today.month
             year = today.year
 
     start = date(year, month, 1)
-    if month == 12:
-        end = date(year + 1, 1, 1)
-    else:
-        end = date(year, month + 1, 1)
+    end_y, end_m = _add_months(year, month, 1)
+    end = date(end_y, end_m, 1)
     return start.isoformat(), end.isoformat()
 
 
@@ -1268,7 +1460,9 @@ def enhance_for_sql(question, history=None, domain=None):
             "(Jan 1 through Dec 31 of that year). Do not use a different year."
         )
 
-    month_note = month_breakdown_guidance(question)
+    month_note = month_breakdown_guidance(
+        question, history=history, last_result=None
+    )
     if month_note:
         notes.append(month_note)
 
@@ -1283,12 +1477,14 @@ def enhance_for_sql(question, history=None, domain=None):
     if is_continuation_followup(question):
         notes.append(
             "FOLLOW-UP: Keep all filters from the previous question "
-            "(person, date range, thresholds like > 9 hours, day exclusions). "
-            "Only change what the user newly asked for (e.g. average instead of list, "
-            "or ADD newly excluded weekdays on top of earlier exclusions). "
+            "(person, date range, month-by-month grouping, thresholds, day exclusions). "
+            "If the previous answer was month-by-month, this follow-up MUST also return "
+            "one row per month for that same period (full year or January–March range) — "
+            "do NOT collapse to this month only. "
+            "Only change what the user newly asked for (e.g. ADD logged hours as a column). "
             "If weekends were already excluded and the user now excludes Fridays, "
             "keep Saturday/Sunday out AND also exclude Friday. "
-            "CRITICAL: Write fresh SQL and recalculate the number. "
+            "CRITICAL: Write fresh SQL and recalculate. "
             "Do not copy the previous answer's hours/average unchanged."
         )
 
@@ -4520,6 +4716,9 @@ def build_prohance_hours_followup_sql(
     Deterministic AVG/SUM logged_hours SQL for follow-ups, including day exclusions.
     Forces a fresh recalculation so "excluding Friday" cannot reuse the prior number.
     """
+    # Month-by-month follow-ups must keep one row per month — handled elsewhere.
+    if effective_wants_month_breakdown(question, history, last_result):
+        return None
     if not is_hours_followup_question(question, history, last_result):
         return None
 
@@ -4578,18 +4777,32 @@ def build_month_breakdown_hours_sql(
     confirmed_employee_id=None,
     primary_table=None,
     history=None,
+    last_result=None,
 ):
     """
     Deterministic month-by-month AVG/SUM logged_hours.
-    Returns month + avg_seconds/total_seconds so the app can format HH:MM:SS.
+    Also handles follow-ups like "also show logged hours" after a prior
+    month-by-month question — keeps the same months/year, not just this month.
     """
-    if not wants_month_breakdown(question):
+    text = question or ""
+    if not effective_wants_month_breakdown(text, history, last_result):
         return None
-    if not re.search(
-        r"\b(logged\s*hours?|avg(?:erage)?\s+(?:logged\s*)?hours?|total\s+(?:logged\s*)?hours?|hours?\s+logged)\b",
-        question or "",
-        re.IGNORECASE,
+
+    asks_hours = bool(
+        re.search(
+            r"\b(logged\s*hours?|avg(?:erage)?\s+(?:logged\s*)?hours?|"
+            r"total\s+(?:logged\s*)?hours?|hours?\s+logged|\bhours?\b)\b",
+            text,
+            re.IGNORECASE,
+        )
+    )
+    # Follow-up that only adds hours onto a prior month-by-month thread.
+    if not asks_hours and not (
+        is_continuation_followup(text)
+        and re.search(r"\b(logged|hours?|avg|average)\b", text, re.I)
     ):
+        return None
+    if not asks_hours:
         return None
 
     person = (confirmed_username or "").strip()
@@ -4599,26 +4812,15 @@ def build_month_breakdown_hours_sql(
             person = " ".join(hints)
     if not person:
         person = _person_from_history_questions(history)
+    if not person and isinstance(last_result, dict):
+        person = _extract_username_from_sql(str(last_result.get("query") or ""))
     if not person:
         return None
 
-    start_iso, end_iso = extract_period_bounds(question)
-    # Month-by-month with no year/month named → full current year, not just this month.
-    year = extract_year_from_question(question)
-    if year is not None and not re.search(
-        rf"\b({_CALENDAR_MONTHS}|this\s+month)\b",
-        question or "",
-        re.IGNORECASE,
-    ):
-        start_iso, end_iso = f"{year}-01-01", f"{year + 1}-01-01"
-    elif not re.search(
-        rf"\b({_CALENDAR_MONTHS}|20\d{{2}}|this\s+year|last\s+year|this\s+month|"
-        rf"(?:for|in|of|year)\s+'?\d{{2}})\b",
-        question or "",
-        re.IGNORECASE,
-    ):
-        y = date.today().year
-        start_iso, end_iso = f"{y}-01-01", f"{y + 1}-01-01"
+    start_iso, end_iso = resolve_period_bounds(
+        text, history=history, last_result=last_result
+    )
+
     table_name = primary_table or (
         schema_provider.get_primary_table_name() if "schema_provider" in globals() else None
     ) or "EmployeeAttendance"
@@ -4631,8 +4833,16 @@ def build_month_breakdown_hours_sql(
         "COALESCE(DATEDIFF(SECOND, 0, "
         "TRY_CAST(NULLIF(LTRIM(RTRIM(logged_hours)), '') AS TIME)), 0)"
     )
+
+    # Prefer avg when current or prior ask said average.
+    prior_q = prior_question_text(history, last_result)
     use_avg = bool(
-        re.search(r"\bavg(?:erage)?\b", question or "", re.IGNORECASE)
+        re.search(r"\bavg(?:erage)?\b", text, re.IGNORECASE)
+        or (
+            is_continuation_followup(text)
+            and re.search(r"\bavg(?:erage)?\b", prior_q or "", re.IGNORECASE)
+            and not re.search(r"\b(total|sum)\b", text, re.IGNORECASE)
+        )
     )
     if use_avg:
         metric_expr = f"CAST(ROUND(AVG({seconds_expr}), 0) AS int) AS avg_seconds"
@@ -4681,11 +4891,32 @@ def extract_year_from_question(question, default=None):
 
 def extract_period_bounds(question):
     """
-    Return (start_iso, end_iso) for a named month, full year, or this month.
-    Year-only / this year (no calendar month name) → Jan 1 .. next Jan 1.
+    Return (start_iso, end_iso) for:
+      - inclusive month ranges (January to March)
+      - month-by-month / month-to-month → full calendar year
+      - a named month, year, or this month
     """
     text = question or ""
     today = date.today()
+
+    ranged = extract_month_range_bounds(text)
+    if ranged:
+        return ranged
+
+    # Month-by-month / month-to-month → all months of that year.
+    if re.search(
+        r"\b("
+        r"month\s*by\s*month|month\s*to\s*month|month\s+over\s+month|"
+        r"by\s+month|each\s+month|monthly(?:\s+breakdown)?|per\s+month|\bmom\b"
+        r")\b",
+        text,
+        re.IGNORECASE,
+    ):
+        year = extract_year_from_question(text) or today.year
+        if re.search(r"\bthis\s+year\b", text, re.IGNORECASE):
+            year = today.year
+        return f"{year}-01-01", f"{year + 1}-01-01"
+
     month_named = bool(
         re.search(rf"\b({_CALENDAR_MONTHS})\b", text, re.IGNORECASE)
     )
@@ -4704,9 +4935,19 @@ def wants_month_breakdown(question):
     text = question or ""
     if re.search(
         r"\b("
-        r"month\s*by\s*month|by\s+month|each\s+month|monthly\s+breakdown|"
-        r"per\s+month|months?\s+this\s+year|month\s+over\s+month|\bmom\b|"
-        r"monthly"
+        r"month\s*by\s*month|month\s*to\s*month|by\s+month|each\s+month|"
+        r"monthly\s+breakdown|per\s+month|months?\s+this\s+year|"
+        r"month\s+over\s+month|\bmom\b|monthly"
+        r")\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return True
+    # Inclusive multi-month ranges imply month-by-month rows when metrics are asked.
+    if extract_month_range_bounds(text) and re.search(
+        r"\b("
+        r"logged\s*hours?|hours?|break|submitt?als?|submits?|interviews?|"
+        r"hires?|offers?|starts?|rejects?|avg|average|total"
         r")\b",
         text,
         re.IGNORECASE,
@@ -4730,13 +4971,97 @@ def wants_month_breakdown(question):
     has_specific_month = bool(
         re.search(rf"\b({_CALENDAR_MONTHS})\b", text, re.IGNORECASE)
     )
+    # A month range is not a "single month" exclusion from year totals.
+    if extract_month_range_bounds(text):
+        has_specific_month = False
     return bool(has_year and has_hours and not has_specific_month)
 
 
-def month_breakdown_guidance(question):
-    if not wants_month_breakdown(question):
+def prior_question_text(history=None, last_result=None):
+    """Latest prior user question from history / last_result."""
+    if isinstance(last_result, dict):
+        prior_q = str(last_result.get("question") or "").strip()
+        if prior_q:
+            return prior_q
+    for item in reversed(history or []):
+        if str(item.get("role") or "").lower() != "user":
+            continue
+        content = str(item.get("content") or "").strip()
+        if content:
+            return content
+    return ""
+
+
+def prior_wants_month_breakdown(history=None, last_result=None):
+    prior_q = prior_question_text(history, last_result)
+    if prior_q and wants_month_breakdown(prior_q):
+        return True
+    prior_sql = ""
+    if isinstance(last_result, dict):
+        prior_sql = str(last_result.get("query") or "")
+    if not prior_sql:
+        prior_sql = _prior_sql_from_context(history, last_result)
+    return bool(
+        re.search(
+            r"\bDATENAME\s*\(\s*month\b|\bGROUP\s+BY\s+DATENAME\s*\(\s*month",
+            prior_sql or "",
+            re.IGNORECASE,
+        )
+    )
+
+
+def effective_wants_month_breakdown(question, history=None, last_result=None):
+    """Current ask or a follow-up that should keep month-by-month from prior turn."""
+    if wants_month_breakdown(question):
+        return True
+    if is_continuation_followup(question) and prior_wants_month_breakdown(
+        history, last_result
+    ):
+        return True
+    return False
+
+
+def resolve_period_bounds(question, history=None, last_result=None):
+    """
+    Period for the current ask, inheriting prior month-by-month / SQL bounds
+    on follow-ups like "also show logged hours".
+    """
+    text = question or ""
+    # Explicit range / year / month on this turn wins.
+    if extract_month_range_bounds(text) or extract_year_from_question(text) is not None:
+        return extract_period_bounds(text)
+    if re.search(
+        rf"\b({_CALENDAR_MONTHS}|this\s+year|this\s+month|last\s+month)\b",
+        text,
+        re.IGNORECASE,
+    ) and not is_continuation_followup(text):
+        return extract_period_bounds(text)
+
+    if is_continuation_followup(text) or effective_wants_month_breakdown(
+        text, history, last_result
+    ):
+        prior_sql = _prior_sql_from_context(history, last_result)
+        bounds = _extract_date_bounds_from_sql(prior_sql)
+        if bounds:
+            return bounds
+        prior_q = prior_question_text(history, last_result)
+        if prior_q:
+            return extract_period_bounds(prior_q)
+
+    if effective_wants_month_breakdown(text, history, last_result):
+        y = date.today().year
+        return f"{y}-01-01", f"{y + 1}-01-01"
+
+    return extract_period_bounds(text)
+
+
+def month_breakdown_guidance(question, history=None, last_result=None):
+    if not effective_wants_month_breakdown(question, history, last_result):
         return None
-    metric_order = extract_requested_metric_order(question)
+    # Use current + prior metrics so follow-ups keep column intent.
+    prior_q = prior_question_text(history, last_result)
+    metric_source = f"{prior_q} {question}" if prior_q and is_continuation_followup(question) else question
+    metric_order = extract_requested_metric_order(metric_source)
     if metric_order:
         order_note = (
             " Column order MUST be: month, then "
@@ -4748,6 +5073,20 @@ def month_breakdown_guidance(question):
             " Column order MUST start with month, then each metric in the "
             "same order the user asked."
         )
+    range_note = ""
+    ranged = extract_month_range_bounds(question) or (
+        extract_month_range_bounds(prior_q) if prior_q else None
+    )
+    if ranged:
+        range_note = (
+            f" Date filter MUST be sessionDate/stage date >= '{ranged[0]}' "
+            f"AND < '{ranged[1]}' (inclusive month range)."
+        )
+    else:
+        range_note = (
+            " For month-by-month / month-to-month with no smaller range, "
+            "cover the full calendar year (Jan 1 through Dec 31)."
+        )
     return (
         "MONTH BREAKDOWN: Return one row per calendar month. "
         "Select ONLY DATENAME(month, <date>) AS month (display name like January). "
@@ -4756,6 +5095,7 @@ def month_breakdown_guidance(question):
         "Do NOT select MONTH(<date>) / month_num as an output column — "
         "users only want the month name, not a number column."
         + order_note
+        + range_note
         + " For hours/breaks return INTEGER seconds columns "
         "(total_seconds / avg_seconds / break_seconds) — the app formats as "
         "hours:minutes:seconds (HH:MM:SS, hours may exceed 24)."
@@ -5501,12 +5841,22 @@ def ask_question():
                 confirmed_employee_id=confirmed_employee_id,
             )
         if not sql_query:
+            sql_query = build_month_breakdown_with_hours_followup_sql(
+                question,
+                history=history,
+                last_result=last_result,
+                confirmed_username=confirmed_username,
+                confirmed_employee_id=confirmed_employee_id,
+                primary_table=primary_table,
+            )
+        if not sql_query:
             sql_query = build_month_breakdown_hours_sql(
                 question,
                 confirmed_username=confirmed_username,
                 confirmed_employee_id=confirmed_employee_id,
                 primary_table=primary_table,
                 history=history,
+                last_result=last_result,
             )
         if not sql_query:
             sql_query = build_attendance_day_count_sql(
@@ -5618,9 +5968,15 @@ def ask_question():
                     pass
 
         duration_hint = build_duration_answer_context(raw_results, question)
-        results = enrich_duration_results(raw_results, question)
+        # Follow-ups like "also show logged hours" should keep prior metric order.
+        order_question = question
+        if is_continuation_followup(question):
+            prior_q = prior_question_text(history, last_result)
+            if prior_q:
+                order_question = f"{prior_q}\n{question}"
+        results = enrich_duration_results(raw_results, order_question)
         # Prefer the enriched HH:MM:SS values for the spoken answer (avoids raw 66704).
-        enriched_hint = build_duration_answer_context(results, question)
+        enriched_hint = build_duration_answer_context(results, order_question)
         if enriched_hint:
             duration_hint = enriched_hint
         candidates = get_candidates(results)
@@ -5668,7 +6024,7 @@ def ask_question():
             duration_hint=duration_hint,
         )
         chart_type = recommend_chart(results, chart_type, question)
-        columns = result_column_order(results, question)
+        columns = result_column_order(results, order_question)
 
         return jsonify(
             {
