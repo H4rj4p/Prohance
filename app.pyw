@@ -5016,10 +5016,43 @@ def extract_period_bounds(question):
     return extract_month_year_bounds(question)
 
 
+def is_single_named_month_ask(question):
+    """
+    True when the user named one calendar month (e.g. July) and did not ask
+    for a multi-month range, a year, or an explicit month-by-month breakdown.
+    Those asks should return that month only — not every month of the year.
+    """
+    text = question or ""
+    if not text.strip():
+        return False
+    if extract_month_range_bounds(text):
+        return False
+    if extract_year_from_question(text) is not None and not re.search(
+        rf"\b({_CALENDAR_MONTHS})\b", text, re.IGNORECASE
+    ):
+        return False
+    if not re.search(rf"\b({_CALENDAR_MONTHS})\b", text, re.IGNORECASE):
+        return False
+    # Explicit multi-month wording wins over a named month.
+    if re.search(
+        r"\b("
+        r"month\s*by\s*month|month\s*to\s*month|month\s+over\s+month|"
+        r"by\s+month|each\s+month|per\s+month|monthly|\bmom\b|"
+        r"this\s+year|last\s+year|years?|yearly"
+        r")\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return False
+    return True
+
+
 def wants_month_breakdown(question):
     """
     True when results should be one row per calendar month.
     Any mention of month, year, a calendar year, or a named month triggers this.
+    A single named month (July) still uses month labeling, but the date filter
+    is that month only — not the full year.
     """
     text = question or ""
     if not text.strip():
@@ -5160,22 +5193,31 @@ def month_breakdown_guidance(question, history=None, last_result=None):
             " Column order MUST start with month, then each metric in the "
             "same order the user asked."
         )
-    range_note = ""
-    ranged = extract_month_range_bounds(question) or (
-        extract_month_range_bounds(prior_q) if prior_q else None
+    start_iso, end_iso = resolve_period_bounds(
+        question, history=history, last_result=last_result
     )
-    if ranged:
+    if is_single_named_month_ask(question):
         range_note = (
-            f" Date filter MUST be sessionDate/stage date >= '{ranged[0]}' "
-            f"AND < '{ranged[1]}' (inclusive month range)."
+            f" SINGLE MONTH ONLY: Date filter MUST be >= '{start_iso}' AND < '{end_iso}'. "
+            "Return only that named month (e.g. July) — do NOT return other months "
+            "or expand to the full year."
+        )
+    elif extract_month_range_bounds(question) or (
+        prior_q and extract_month_range_bounds(prior_q)
+    ):
+        range_note = (
+            f" Date filter MUST be sessionDate/stage date >= '{start_iso}' "
+            f"AND < '{end_iso}' (inclusive month range). "
+            "One row per month inside that range only."
         )
     else:
         range_note = (
-            " For month-by-month / month-to-month with no smaller range, "
-            "cover the full calendar year (Jan 1 through Dec 31)."
+            f" Date filter MUST be >= '{start_iso}' AND < '{end_iso}'. "
+            "For month-by-month / year asks with no smaller range, "
+            "cover that full period with one row per month."
         )
     return (
-        "MONTH BREAKDOWN: Return one row per calendar month. "
+        "MONTH BREAKDOWN: Return one row per calendar month in the date filter. "
         "Select ONLY DATENAME(month, <date>) AS month (display name like January). "
         "GROUP BY DATENAME(month, <date>), MONTH(<date>), YEAR(<date>) "
         "ORDER BY YEAR(<date>), MONTH(<date>). "
