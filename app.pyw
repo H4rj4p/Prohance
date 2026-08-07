@@ -1114,6 +1114,13 @@ def build_datavista_stage_counts_sql(
     return "SELECT " + ", ".join(select_parts)
 
 
+def sql_has_month_breakdown(sql):
+    """True when SQL returns one row per month via DATENAME(month, ...)."""
+    return bool(
+        re.search(r"\bDATENAME\s*\(\s*month\b", sql or "", re.IGNORECASE)
+    )
+
+
 def build_month_breakdown_with_hours_followup_sql(
     question,
     history=None,
@@ -1145,6 +1152,12 @@ def build_month_breakdown_with_hours_followup_sql(
     stages = requested_datavista_stages(text)
     if len(stages) < 1 and prior_q:
         stages = requested_datavista_stages(prior_q)
+    # "monthly performance" / mixed with hours but no stage words → default set.
+    if len(stages) < 1 and (
+        re.search(r"\bperformance\b", text, re.I)
+        or is_mixed_performance_question(text)
+    ):
+        stages = ["submittals", "interviews", "offers", "starts"]
     # If no recruiting stages in the thread, plain hours month-breakdown handles it.
     if len(stages) < 1:
         return None
@@ -6001,67 +6014,120 @@ def ask_question():
                 }
             )
 
-        # Month-by-month stages + hours first so mixed single-row totals do not win.
-        sql_query = build_month_breakdown_with_hours_followup_sql(
-            question,
-            history=history,
-            last_result=last_result,
-            confirmed_username=confirmed_username,
-            confirmed_employee_id=confirmed_employee_id,
-            primary_table=primary_table,
+        month_mode = bool(
+            wants_month_breakdown(question)
+            or effective_wants_month_breakdown(
+                question, history=history, last_result=last_result
+            )
+            or re.search(
+                r"\b(monthly|month\s*by\s*month|month\s*to\s*month|"
+                r"by\s+month|each\s+month|per\s+month|\bmom\b)\b",
+                question or "",
+                re.IGNORECASE,
+            )
         )
-        if not sql_query:
+        person_for_sql = (
+            confirmed_username
+            or _person_from_history_questions(history)
+            or " ".join(extract_name_hints(question) or [])
+        ).strip() or None
+
+        def _forced_monthly_sql(person_name):
+            """Only month-by-month builders — never mixed single-row performance."""
+            built = build_month_breakdown_with_hours_followup_sql(
+                question,
+                history=history,
+                last_result=last_result,
+                confirmed_username=person_name,
+                confirmed_employee_id=confirmed_employee_id,
+                primary_table=primary_table,
+            )
+            if not built:
+                built = build_datavista_stage_counts_sql(
+                    question,
+                    confirmed_username=person_name,
+                    confirmed_employee_id=confirmed_employee_id,
+                    history=history,
+                    last_result=last_result,
+                )
+            if not built:
+                built = build_month_breakdown_hours_sql(
+                    question,
+                    confirmed_username=person_name,
+                    confirmed_employee_id=confirmed_employee_id,
+                    primary_table=primary_table,
+                    history=history,
+                    last_result=last_result,
+                )
+            return built
+
+        if month_mode:
+            # CRITICAL: monthly / month-by-month must never use mixed performance
+            # (that path returns one row: submittals/interviews/offers/starts/avg).
+            sql_query = _forced_monthly_sql(person_for_sql)
+            if not sql_query:
+                sql_query = generate_sql(
+                    question,
+                    history,
+                    primary_table,
+                    confirmed_username or person_for_sql,
+                    confirmed_employee_id,
+                    domain=domain,
+                )
+        else:
             sql_query = build_mixed_performance_sql(
                 question,
                 confirmed_username=confirmed_username,
                 confirmed_employee_id=confirmed_employee_id,
                 primary_table=primary_table,
             )
-        if not sql_query:
-            sql_query = build_datavista_stage_counts_sql(
-                question,
-                confirmed_username=confirmed_username,
-                confirmed_employee_id=confirmed_employee_id,
-                history=history,
-                last_result=last_result,
-            )
-        if not sql_query:
-            sql_query = build_month_breakdown_hours_sql(
-                question,
-                confirmed_username=confirmed_username,
-                confirmed_employee_id=confirmed_employee_id,
-                primary_table=primary_table,
-                history=history,
-                last_result=last_result,
-            )
-        if not sql_query:
-            sql_query = build_attendance_day_count_sql(
-                question,
-                history=history,
-                last_result=last_result,
-                confirmed_username=confirmed_username,
-                primary_table=primary_table,
-            )
-        if not sql_query:
-            sql_query = build_prohance_hours_followup_sql(
-                question,
-                history=history,
-                last_result=last_result,
-                confirmed_username=confirmed_username,
-                primary_table=primary_table,
-            )
-        if not sql_query:
-            sql_query = generate_sql(
-                question,
-                history,
-                primary_table,
-                confirmed_username,
-                confirmed_employee_id,
-                domain=domain,
-            )
+            if not sql_query:
+                sql_query = build_datavista_stage_counts_sql(
+                    question,
+                    confirmed_username=confirmed_username,
+                    confirmed_employee_id=confirmed_employee_id,
+                    history=history,
+                    last_result=last_result,
+                )
+            if not sql_query:
+                sql_query = build_month_breakdown_hours_sql(
+                    question,
+                    confirmed_username=confirmed_username,
+                    confirmed_employee_id=confirmed_employee_id,
+                    primary_table=primary_table,
+                    history=history,
+                    last_result=last_result,
+                )
+            if not sql_query:
+                sql_query = build_attendance_day_count_sql(
+                    question,
+                    history=history,
+                    last_result=last_result,
+                    confirmed_username=confirmed_username,
+                    primary_table=primary_table,
+                )
+            if not sql_query:
+                sql_query = build_prohance_hours_followup_sql(
+                    question,
+                    history=history,
+                    last_result=last_result,
+                    confirmed_username=confirmed_username,
+                    primary_table=primary_table,
+                )
+            if not sql_query:
+                sql_query = generate_sql(
+                    question,
+                    history,
+                    primary_table,
+                    confirmed_username,
+                    confirmed_employee_id,
+                    domain=domain,
+                )
+
         # If LLM omitted day exclusions on an hours follow-up, force deterministic SQL.
         if (
-            domain == "prohance"
+            not month_mode
+            and domain == "prohance"
             and is_hours_followup_question(question, history, last_result)
             and collect_excluded_weekdays(question, history)[0]
             and not re.search(r"\bDATENAME\s*\(\s*WEEKDAY", sql_query or "", re.I)
@@ -6078,56 +6144,37 @@ def ask_question():
             if rebuilt:
                 sql_query = rebuilt
 
-        # Hard guard: monthly / month-by-month / year asks must not return a
-        # single total row (mixed performance / LLM often emit one row with
-        # submittals, interviews, offers, starts, avg_logged_seconds).
-        if effective_wants_month_breakdown(
-            question, history=history, last_result=last_result
-        ) and not re.search(
-            r"\bDATENAME\s*\(\s*month\b", sql_query or "", re.IGNORECASE
-        ):
-            person_for_month = (
-                confirmed_username
+        # Absolute guard before and after cleanup.
+        if month_mode and not sql_has_month_breakdown(sql_query):
+            rebuilt = _forced_monthly_sql(
+                person_for_sql
                 or _extract_username_from_sql(sql_query)
-                or _person_from_history_questions(history)
-                or " ".join(extract_name_hints(question) or [])
-            ).strip()
-            rebuilt = build_month_breakdown_with_hours_followup_sql(
-                question,
-                history=history,
-                last_result=last_result,
-                confirmed_username=person_for_month or None,
-                confirmed_employee_id=confirmed_employee_id,
-                primary_table=primary_table,
             )
-            if not rebuilt:
-                rebuilt = build_datavista_stage_counts_sql(
-                    question,
-                    confirmed_username=person_for_month or None,
-                    confirmed_employee_id=confirmed_employee_id,
-                    history=history,
-                    last_result=last_result,
-                )
-            if not rebuilt:
-                rebuilt = build_month_breakdown_hours_sql(
-                    question,
-                    confirmed_username=person_for_month or None,
-                    confirmed_employee_id=confirmed_employee_id,
-                    primary_table=primary_table,
-                    history=history,
-                    last_result=last_result,
-                )
             if rebuilt:
                 sql_query = rebuilt
 
         sql_query = clean_sql(sql_query, primary_table or "EmployeeAttendance")
         sql_query = remove_broad_query_limit(sql_query, question)
         sql_query = ensure_single_readonly_sql(sql_query)
-        if domain == "datavista" or is_mixed_performance_question(question):
+        if domain == "datavista" or is_mixed_performance_question(question) or month_mode:
             sql_query = qualify_datavista_sql(sql_query)
             sql_query = fix_prohance_object_names(
                 sql_query, table_name=primary_table or "EmployeeAttendance"
             )
+
+        if month_mode and not sql_has_month_breakdown(sql_query):
+            rebuilt = _forced_monthly_sql(
+                person_for_sql
+                or _extract_username_from_sql(sql_query)
+            )
+            if rebuilt:
+                sql_query = clean_sql(rebuilt, primary_table or "EmployeeAttendance")
+                sql_query = remove_broad_query_limit(sql_query, question)
+                sql_query = ensure_single_readonly_sql(sql_query)
+                sql_query = qualify_datavista_sql(sql_query)
+                sql_query = fix_prohance_object_names(
+                    sql_query, table_name=primary_table or "EmployeeAttendance"
+                )
 
         if sql_query.upper() == "NA":
             return jsonify(
@@ -6156,8 +6203,9 @@ def ask_question():
 
         raw_results = execute_sql(sql_query)
         # If the user asked for several metrics but SQL only returned one, regenerate once.
+        # Never let this retry replace a monthly DATENAME breakdown with a one-row total.
         missing = missing_requested_metrics(question, raw_results)
-        if missing and domain == "prohance":
+        if missing and domain == "prohance" and not month_mode:
             retry_question = (
                 f"{question}\n\n"
                 f"CRITICAL RETRY: Previous SQL missed these metrics: {', '.join(missing)}. "
