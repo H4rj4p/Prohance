@@ -381,7 +381,8 @@ def detect_question_domain(question, history=None, last_result=None):
 
     Prohance is ONLY for logged hours, breaks, AAFS, login/logout, attendance.
     Submits, pay rates, start/placement dates, clients, candidates → DataVista.
-    Continuation follow-ups ("excluding Fridays", "and avg") inherit the prior domain.
+    Continuation follow-ups ("excluding Fridays", "and avg", "include logged hours")
+    inherit the prior domain when this turn alone would mis-route.
     When unsure, prefer DataVista (not Prohance).
     """
     text = question or ""
@@ -409,16 +410,20 @@ def detect_question_domain(question, history=None, last_result=None):
         ):
             return "datavista"
         return "prohance"
+
+    # "include logged hours" after interviews/hires/starts must stay on DataVista
+    # so mixed month-by-month SQL (stages + hours) is used — not Prohance-only.
+    if is_continuation_followup(question):
+        inherited = infer_domain_from_context(history, last_result)
+        if inherited == "datavista" and has_prohance and not has_datavista:
+            return "datavista"
+        if inherited and not has_prohance and not has_datavista:
+            return inherited
+
     if has_prohance:
         return "prohance"
     if has_datavista:
         return "datavista"
-
-    # "excluding Fridays" / "and avg" have no domain keywords — stay on prior domain.
-    if is_continuation_followup(question):
-        inherited = infer_domain_from_context(history, last_result)
-        if inherited:
-            return inherited
 
     # Default: DataVista for non-attendance questions.
     return "datavista"
@@ -1163,14 +1168,20 @@ def build_month_breakdown_with_hours_followup_sql(
             f"GROUP BY DATENAME(month, {date_expr}), MONTH({date_expr}), YEAR({date_expr})"
         )
 
-    sum_cols = ", ".join(f"SUM(s.{stage}) AS {stage}" for stage in stages)
+    # Aggregate stages first, then join hours. Use a single alias (AS s) —
+    # "AS stage_rows s" is invalid T-SQL and caused SQL error 42000.
+    sum_cols = ", ".join(f"SUM({stage}) AS {stage}" for stage in stages)
     return (
         "SELECT s.month, "
-        + sum_cols
+        + ", ".join(f"s.{stage}" for stage in stages)
         + f", h.{hours_alias} AS {hours_alias} "
         "FROM ("
+        f"SELECT month, _month_num, _year_num, {sum_cols} "
+        "FROM ("
         + " UNION ALL ".join(union_parts)
-        + ") AS stage_rows s "
+        + ") AS stage_rows "
+        "GROUP BY month, _month_num, _year_num"
+        ") AS s "
         "LEFT JOIN ("
         f"SELECT DATENAME(month, sessionDate) AS month, "
         f"MONTH(sessionDate) AS _month_num, YEAR(sessionDate) AS _year_num, "
@@ -1181,8 +1192,6 @@ def build_month_breakdown_with_hours_followup_sql(
         f"AND sessionDate >= '{start_iso}' AND sessionDate < '{end_iso}' "
         "GROUP BY DATENAME(month, sessionDate), MONTH(sessionDate), YEAR(sessionDate)"
         ") AS h ON s._month_num = h._month_num AND s._year_num = h._year_num "
-        "GROUP BY s.month, s._month_num, s._year_num, "
-        f"h.{hours_alias} "
         "ORDER BY s._year_num, s._month_num"
     )
 
@@ -2053,26 +2062,33 @@ def fix_prohance_object_names(sql, db_name=None, table_name=None):
         # Any other database label (Prohance, DataVista, etc.) → live attendance object.
         return target
 
-    # Any three-part attendance reference with a wrong DB/table → connected object.
+    # Three-part attendance refs with a wrong DB/table → connected object.
+    # Prefer fully-bracketed matches first so a leading "[" is never left behind.
     sql = re.sub(
-        rf"\[?([A-Za-z0-9_]+)\]?\s*\.\s*\[?dbo\]?\s*\.\s*\[?([A-Za-z0-9_]+)\]?",
+        rf"\[([A-Za-z0-9_]+)\]\s*\.\s*\[dbo\]\s*\.\s*\[([A-Za-z0-9_]+)\]",
+        _rewrite_three_part,
+        sql,
+        flags=re.IGNORECASE,
+    )
+    sql = re.sub(
+        rf"\b([A-Za-z0-9_]+)\s*\.\s*dbo\s*\.\s*([A-Za-z0-9_]+)\b",
         _rewrite_three_part,
         sql,
         flags=re.IGNORECASE,
     )
 
-    # Bare unbracketed EmployeeAttendance → three-part when query already touches DataVista.
-    # Do NOT use optional \[? \]?\ — that ate into [EmployeeAttendance] and double-wrapped (42000).
+    # Bare / single-bracket attendance table → three-part when query touches DataVista.
+    # Skip names already qualified as something.[dbo].[Table].
     if re.search(r"\bCR_(?:Submittal|Interview|Hire|Reject)Master\b", sql, re.IGNORECASE):
-        sql = re.sub(
-            rf"(?<![\w.\[])\bEmployeeAttendance\b(?![\w.\]])",
-            target,
-            sql,
-            flags=re.IGNORECASE,
-        )
-        if table_name.lower() != "employeeattendance":
+        for att_name in sorted({table_name, "EmployeeAttendance"}, key=len, reverse=True):
             sql = re.sub(
-                rf"(?<![\w.\[])\b{re.escape(table_name)}\b(?![\w.\]])",
+                rf"(?<!\.\[dbo\]\.)(?<!\.dbo\.)\[{re.escape(att_name)}\]",
+                target,
+                sql,
+                flags=re.IGNORECASE,
+            )
+            sql = re.sub(
+                rf"(?<![\w.\[])\b{re.escape(att_name)}\b(?![\w.\]])",
                 target,
                 sql,
                 flags=re.IGNORECASE,
@@ -4416,13 +4432,26 @@ def is_continuation_followup(question):
         return True
     if re.match(
         r"^\s*(and|also|plus|now|then|okay|ok|alright|sure|please|"
+        r"include|including|"
         r"what\s+about|how\s+about|excluding|exclude|without|except)\b",
         text,
         re.IGNORECASE,
     ):
         return True
+    # "include/add/with logged hours" mid-sentence follow-ups.
+    if re.match(
+        r"^\s*(add|with)\b",
+        text,
+        re.IGNORECASE,
+    ) and re.search(
+        r"\b(logged\s*hours?|hours?|avg|average|break|breaks)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return True
     if re.search(
-        r"\b(what\s+about|how\s+about|the\s+other|as\s+well|too|also)\b",
+        r"\b(what\s+about|how\s+about|the\s+other|as\s+well|too|also|"
+        r"include|including)\b",
         text,
         re.IGNORECASE,
     ):
