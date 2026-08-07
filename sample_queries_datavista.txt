@@ -73,10 +73,9 @@ WHERE NULLIF(LTRIM(RTRIM(COMPANYNAME)), '') IS NOT NULL
    OR NULLIF(LTRIM(RTRIM(AGREEDPAYRATE)), '') IS NOT NULL
 ORDER BY Stage;
 
--- Month-by-month submittals this year (use month NAMES, not 1/2/3)
+-- Month-by-month submittals this year (month NAME only — no month_num column)
 SELECT
-  DATENAME(month, TRY_CONVERT(date, SUBMITTALDATE)) AS month_name,
-  MONTH(TRY_CONVERT(date, SUBMITTALDATE)) AS month_num,
+  DATENAME(month, TRY_CONVERT(date, SUBMITTALDATE)) AS month,
   COUNT(*) AS submittal_count
 FROM DataVista.dbo.CR_SubmittalMaster
 WHERE TRY_CONVERT(date, SUBMITTALDATE) >= DATEFROMPARTS(YEAR(GETDATE()), 1, 1)
@@ -90,6 +89,42 @@ GROUP BY
   MONTH(TRY_CONVERT(date, SUBMITTALDATE)),
   YEAR(TRY_CONVERT(date, SUBMITTALDATE))
 ORDER BY YEAR(TRY_CONVERT(date, SUBMITTALDATE)), MONTH(TRY_CONVERT(date, SUBMITTALDATE));
+
+-- July performance: submits, interviews, offers, starts + avg logged hours
+-- Replace Prohance DB/table with the connected attendance database/table.
+SELECT
+  (SELECT COUNT(*)
+   FROM DataVista.dbo.CR_SubmittalMaster
+   WHERE TRY_CONVERT(date, SUBMITTALDATE) >= '2026-07-01'
+     AND TRY_CONVERT(date, SUBMITTALDATE) < '2026-08-01'
+     AND (PRIMARYRECRUITERNAME LIKE 'Disha%' OR USERFIRSTNAME = 'Disha')
+  ) AS submittals,
+  (SELECT COUNT(*)
+   FROM DataVista.dbo.CR_InterviewMaster
+   WHERE TRY_CONVERT(date, INTERVIEWDATE) >= '2026-07-01'
+     AND TRY_CONVERT(date, INTERVIEWDATE) < '2026-08-01'
+     AND (PRIMARYRECRUITERNAME LIKE 'Disha%' OR USERFIRSTNAME = 'Disha')
+  ) AS interviews,
+  (SELECT COUNT(*)
+   FROM DataVista.dbo.CR_HireMaster
+   WHERE TRY_CONVERT(date, PLACEMENTDATE) >= '2026-07-01'
+     AND TRY_CONVERT(date, PLACEMENTDATE) < '2026-08-01'
+     AND (PRIMARYRECRUITERNAME LIKE 'Disha%' OR USERFIRSTNAME = 'Disha')
+  ) AS offers,
+  (SELECT COUNT(*)
+   FROM DataVista.dbo.CR_HireMaster
+   WHERE TRY_CONVERT(date, STARTDATE) >= '2026-07-01'
+     AND TRY_CONVERT(date, STARTDATE) < '2026-08-01'
+     AND (PRIMARYRECRUITERNAME LIKE 'Disha%' OR USERFIRSTNAME = 'Disha')
+  ) AS starts,
+  (SELECT CAST(ROUND(AVG(
+      COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(logged_hours)), '') AS TIME)), 0)
+    ), 0) AS int)
+   FROM EmployeeAttendance
+   WHERE userName LIKE 'Disha%'
+     AND sessionDate >= '2026-07-01'
+     AND sessionDate < '2026-08-01'
+  ) AS avg_logged_seconds;
 
 -- How many submittals did a recruiter make this month? (COUNT only — no UNION)
 SELECT COUNT(*) AS submittal_count

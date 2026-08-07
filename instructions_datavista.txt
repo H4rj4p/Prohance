@@ -74,6 +74,11 @@ Rules:
 5. Same pattern for interviews / hires / rejects with their own table + date column.
 6. Only if the stage is not specified, UNION ALL across all four CR_* tables with a Stage column.
 7. For "how many clients/companies", COUNT(DISTINCT COMPANYNAME).
+8. Mixed "performance" (submits + interviews + offers + starts + avg logged hours):
+   ONE SELECT with scalar subqueries. Use real three-part names for DataVista CR_*
+   tables AND the connected Prohance attendance table — never invent [Prohance].[dbo]....
+9. Month-by-month: SELECT DATENAME(month, <date>) AS month only.
+   Do NOT also select MONTH(<date>) AS month_num / month_number in the result columns.
 
 ## Table guide (be precise)
 

@@ -132,6 +132,43 @@ def open_sql_server_connection():
     return pyodbc.connect(connection_string, timeout=30, autocommit=True)
 
 
+_cached_connected_db_name = None
+_cached_connected_db_checked = False
+
+
+def get_connected_database_name():
+    """Return configured SQL database name (cached). Prefer live DB_NAME(), else connection string."""
+    global _cached_connected_db_name, _cached_connected_db_checked
+    if _cached_connected_db_checked:
+        return _cached_connected_db_name
+    _cached_connected_db_checked = True
+
+    connection_string = get_connection_string()
+    if connection_string is None:
+        _cached_connected_db_name = None
+        return None
+
+    try:
+        with open_sql_server_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT DB_NAME() AS DatabaseName")
+                row = cursor.fetchone()
+                if row and row.DatabaseName:
+                    _cached_connected_db_name = str(row.DatabaseName)
+                    return _cached_connected_db_name
+    except Exception:
+        pass
+
+    values = parse_connection_string(connection_string)
+    for key in ("database", "initial catalog"):
+        if values.get(key):
+            _cached_connected_db_name = values[key]
+            return _cached_connected_db_name
+
+    _cached_connected_db_name = None
+    return None
+
+
 def rows_as_dicts(cursor):
     columns = [column[0] for column in cursor.description or []]
     return [dict(zip(columns, row)) for row in cursor.fetchall()]
@@ -810,14 +847,28 @@ def enhance_for_sql(question):
             and re.search(r"\b(logged\s*hours?|avg|average)\b", text, re.I)
         )
     ):
+        prohance_db = get_connected_database_name() or "YOUR_PROHANCE_DB"
+        prohance_table = schema_provider.get_primary_table_name() or "EmployeeAttendance"
+        datavista_db = get_datavista_database_name()
         notes.append(
             "PERFORMANCE / MIXED METRICS: Named person is the recruiter/user. "
-            "Return ONE SELECT with multiple scalar subqueries or columns: "
-            "submittal COUNT from CR_SubmittalMaster, interview COUNT from CR_InterviewMaster, "
-            "offers/hires COUNT from CR_HireMaster (PLACEMENTDATE), "
-            "starts COUNT from CR_HireMaster (STARTDATE in the month), "
-            "and avg logged hours as avg_seconds from the Prohance attendance table "
-            "matching the same person on userName. Use three-part names for DataVista."
+            "Return ONE SELECT with scalar subqueries / columns only. "
+            f"Use EXACT three-part names (do not invent databases/tables): "
+            f"[{datavista_db}].[dbo].[CR_SubmittalMaster], "
+            f"[{datavista_db}].[dbo].[CR_InterviewMaster], "
+            f"[{datavista_db}].[dbo].[CR_HireMaster], "
+            f"[{prohance_db}].[dbo].[{prohance_table}]. "
+            "Never invent a database named Prohance/Workforce/Attendance — "
+            f"attendance lives in [{prohance_db}].[dbo].[{prohance_table}]. "
+            "Columns for the requested month/period: "
+            "submittals = COUNT(*) from CR_SubmittalMaster (SUBMITTALDATE); "
+            "interviews = COUNT(*) from CR_InterviewMaster (INTERVIEWDATE); "
+            "offers = COUNT(*) from CR_HireMaster (PLACEMENTDATE); "
+            "starts = COUNT(*) from CR_HireMaster (STARTDATE); "
+            f"avg_logged_seconds = AVG(DATEDIFF seconds of logged_hours) from "
+            f"[{prohance_db}].[dbo].[{prohance_table}] where userName matches the person "
+            "and sessionDate in the same period. "
+            "Filter DataVista on PRIMARYRECRUITERNAME / USERFIRSTNAME / USERLASTNAME."
         )
 
     if not notes:
@@ -1295,6 +1346,62 @@ def fix_datavista_schema(sql):
     return sql
 
 
+def fix_prohance_object_names(sql, db_name=None, table_name=None):
+    """
+    Prevent 42S02 from invented names like [Prohance].[dbo].[EmployeeAttendance].
+    Rewrite to the connected database + live attendance table.
+    """
+    if not sql:
+        return sql
+
+    db_name = db_name or get_connected_database_name()
+    table_name = table_name or (
+        schema_provider.get_primary_table_name() if "schema_provider" in globals() else None
+    ) or "EmployeeAttendance"
+    if not db_name:
+        return sql
+
+    target = f"[{db_name}].[dbo].[{table_name}]"
+    attendance_tables = {"employeeattendance", table_name.lower()}
+
+    def _rewrite_three_part(match):
+        found_db = (match.group(1) or "").strip("[]")
+        found_table = (match.group(2) or "").strip("[]")
+        if found_table.lower() not in attendance_tables:
+            return match.group(0)
+        # Already correct.
+        if found_db.lower() == db_name.lower() and found_table.lower() == table_name.lower():
+            return match.group(0)
+        # Any other database label (Prohance, DataVista, etc.) → live attendance object.
+        return target
+
+    # Any three-part attendance reference with a wrong DB/table → connected object.
+    sql = re.sub(
+        rf"\[?([A-Za-z0-9_]+)\]?\s*\.\s*\[?dbo\]?\s*\.\s*\[?([A-Za-z0-9_]+)\]?",
+        _rewrite_three_part,
+        sql,
+        flags=re.IGNORECASE,
+    )
+
+    # Bare EmployeeAttendance → three-part name when query already touches DataVista.
+    if re.search(r"\bCR_(?:Submittal|Interview|Hire|Reject)Master\b", sql, re.IGNORECASE):
+        sql = re.sub(
+            rf"(?<![\w.\]])\[?EmployeeAttendance\]?(?![\w.\]])",
+            target,
+            sql,
+            flags=re.IGNORECASE,
+        )
+        if table_name.lower() != "employeeattendance":
+            sql = re.sub(
+                rf"(?<![\w.\]])\[?{re.escape(table_name)}\]?(?![\w.\]])",
+                target,
+                sql,
+                flags=re.IGNORECASE,
+            )
+
+    return sql
+
+
 def clean_sql(sql, actual_table_name="EmployeeAttendance"):
     if not sql or not sql.strip():
         return "NA"
@@ -1314,6 +1421,7 @@ def clean_sql(sql, actual_table_name="EmployeeAttendance"):
     sql = fix_username_prefix_match(fix_workforce_schema(sql, actual_table_name))
     sql = fix_datavista_schema(sql)
     sql = qualify_datavista_sql(sql)
+    sql = fix_prohance_object_names(sql, table_name=actual_table_name)
     sql = convert_limit_to_top(sql)
     sql = rewrite_duration_time_converts(sql)
     sql = ensure_single_readonly_sql(sql)
@@ -1821,32 +1929,63 @@ _MONTH_NAMES = (
 
 
 def enrich_month_name_results(results):
-    """Replace numeric month columns (1-12) with month names like January."""
+    """
+    Show one month-name column only; drop redundant month_num / month_number.
+    Never convert month_num into a second name column (that made duplicates).
+    """
     if not results:
         return results
 
+    display_keys = {"month", "monthname", "mon"}
+    sort_only_keys = {"monthnum", "monthnumber", "monthno", "monthofyear"}
+
+    def _as_month_name(value):
+        if isinstance(value, str) and value.strip().lower() in {
+            name.lower() for name in _MONTH_NAMES if name
+        }:
+            return value.strip().title()
+        try:
+            month_num = int(float(value))
+        except (TypeError, ValueError):
+            return None
+        if 1 <= month_num <= 12:
+            return _MONTH_NAMES[month_num]
+        return None
+
     enriched = []
     for row in results:
-        new_row = dict(row)
-        for key, value in list(row.items()):
+        new_row = {}
+        pending_name = None
+        sort_only_name = None
+        for key, value in row.items():
             key_l = re.sub(r"[^a-z0-9]+", "", (key or "").lower())
-            if key_l not in {
-                "month",
-                "monthnum",
-                "monthnumber",
-                "monthno",
-                "mon",
-                "monthofyear",
-            }:
+
+            # Drop sort helpers from the UI — keep value only as fallback name source.
+            if key_l in sort_only_keys:
+                name = _as_month_name(value)
+                if name:
+                    sort_only_name = name
                 continue
-            try:
-                month_num = int(float(value))
-            except (TypeError, ValueError):
+
+            if key_l in display_keys:
+                name = _as_month_name(value)
+                if name:
+                    pending_name = name
+                    continue
+                new_row[key] = value
                 continue
-            if 1 <= month_num <= 12:
-                new_row[key] = _MONTH_NAMES[month_num]
-                # Keep sort helper if useful for charts.
-                new_row.setdefault("month_num", month_num)
+
+            new_row[key] = value
+
+        month_label = pending_name or sort_only_name
+        if month_label:
+            new_row["month"] = month_label
+        # Normalize month_name → month when present.
+        if "month_name" in new_row and "month" not in new_row:
+            new_row["month"] = new_row.pop("month_name")
+        elif "month_name" in new_row and "month" in new_row:
+            new_row.pop("month_name", None)
+
         enriched.append(new_row)
     return enriched
 
@@ -3053,11 +3192,11 @@ def month_breakdown_guidance(question):
         return None
     return (
         "MONTH BREAKDOWN: Return one row per calendar month. "
-        "Select DATENAME(month, <date>) AS month_name and MONTH(<date>) AS month_num, "
+        "Select ONLY DATENAME(month, <date>) AS month (display name like January). "
         "GROUP BY DATENAME(month, <date>), MONTH(<date>), YEAR(<date>) "
         "ORDER BY YEAR(<date>), MONTH(<date>). "
-        "Never return only MONTH(<date>) as the display month — users need January/February, "
-        "not 1/2/3. month_num is only for sorting."
+        "Do NOT select MONTH(<date>) / month_num as an output column — "
+        "users only want the month name, not a number column."
     )
 
 
