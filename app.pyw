@@ -655,13 +655,30 @@ def datavista_stage(question):
 
 def datavista_table_guidance(question):
     text = (question or "").lower()
-    stage = datavista_stage(question)
+    stages = requested_datavista_stages(question)
+    stage = stages[0] if len(stages) == 1 else datavista_stage(question)
     count_mode = is_count_question(question)
 
     recruiter_filter = (
         "Treat the named person as the USER/RECRUITER only (never as a candidate). "
         "Filter PRIMARYRECRUITERNAME / USERFIRSTNAME / USERLASTNAME / userid. "
     )
+
+    if len(stages) >= 2:
+        order_note = ", ".join(stages)
+        return (
+            "DATABASE: DataVista. MULTI-STAGE COUNTS. "
+            + recruiter_filter
+            + f"Return ONE SELECT with scalar COUNT(*) subqueries as columns in this order: {order_note}. "
+            "Tables: submittals→CR_SubmittalMaster/SUBMITTALDATE, "
+            "interviews→CR_InterviewMaster/INTERVIEWDATE, "
+            "hires/offers→CR_HireMaster/PLACEMENTDATE, "
+            "starts→CR_HireMaster/STARTDATE, "
+            "rejects→CR_RejectMaster. "
+            "Use TRY_CONVERT(date, ...) for date filters. "
+            "Do NOT UNION tables. Do NOT invent JOINs across stages. "
+            "Alias columns exactly: " + order_note + "."
+        )
 
     if stage == "submittal":
         if count_mode:
@@ -849,11 +866,155 @@ def normalize_user_question(question):
 def is_mixed_performance_question(question):
     text = question or ""
     has_stages = bool(
-        re.search(r"\b(submits?|submittals?|interviews?|offers?|starts?)\b", text, re.I)
+        re.search(
+            r"\b(submits?|submittals?|interviews?|offers?|hires?|starts?|rejects?)\b",
+            text,
+            re.I,
+        )
     )
     has_hours = bool(re.search(r"\b(logged\s*hours?|avg|average)\b", text, re.I))
     has_perf = bool(re.search(r"\bperformance\b", text, re.I))
     return (has_perf and has_stages) or (has_stages and has_hours)
+
+
+DATAVISTA_STAGE_METRICS = (
+    "submittals",
+    "interviews",
+    "hires",
+    "offers",
+    "starts",
+    "rejects",
+)
+
+_STAGE_TABLE_DATE = {
+    "submittals": ("CR_SubmittalMaster", "SUBMITTALDATE"),
+    "interviews": ("CR_InterviewMaster", "INTERVIEWDATE"),
+    "hires": ("CR_HireMaster", "PLACEMENTDATE"),
+    "offers": ("CR_HireMaster", "PLACEMENTDATE"),
+    "starts": ("CR_HireMaster", "STARTDATE"),
+    "rejects": ("CR_RejectMaster", "INTERNALREJECTDATE"),
+}
+
+
+def requested_datavista_stages(question):
+    """Stage metrics in ask order (submittals, interviews, hires, ...)."""
+    ordered = extract_requested_metric_order(question)
+    stages = [m for m in ordered if m in DATAVISTA_STAGE_METRICS]
+    if stages:
+        return stages
+    # Fallback when extract missed plurals / shorthand.
+    text = question or ""
+    found = []
+    specs = [
+        ("submittals", r"\bsubmitt?als?\b|\bsubmits?\b"),
+        ("interviews", r"\binterviews?\b"),
+        ("hires", r"\bhires?\b|\bhired\b"),
+        ("offers", r"\boffers?\b"),
+        ("starts", r"\bstarts?\b"),
+        ("rejects", r"\brejects?\b|\brejected\b"),
+    ]
+    matches = []
+    for alias, pat in specs:
+        for match in re.finditer(pat, text, re.I):
+            matches.append((match.start(), alias))
+    matches.sort(key=lambda item: item[0])
+    for _, alias in matches:
+        if alias not in found:
+            found.append(alias)
+    return found
+
+
+def is_multi_stage_datavista_question(question):
+    return len(requested_datavista_stages(question)) >= 2
+
+
+def _datavista_recruiter_filter(name, confirmed_employee_id=None):
+    safe_name = sql_literal(name)
+    parts = [p for p in re.split(r"\s+", name) if p]
+    first = sql_literal(parts[0]) if parts else safe_name
+    last = sql_literal(parts[-1]) if len(parts) > 1 else ""
+    recruiter_filter = (
+        "("
+        f"PRIMARYRECRUITERNAME = '{safe_name}' "
+        f"OR PRIMARYRECRUITERNAME LIKE '{safe_name} %' "
+        f"OR PRIMARYRECRUITERNAME LIKE '{first}%' "
+        f"OR USERFIRSTNAME = '{first}' "
+    )
+    if last:
+        recruiter_filter += (
+            f"OR (USERFIRSTNAME = '{first}' AND USERLASTNAME = '{last}') "
+            f"OR (USERFIRSTNAME + ' ' + USERLASTNAME) = '{safe_name}' "
+        )
+    if confirmed_employee_id:
+        recruiter_filter += f"OR userid = '{sql_literal(confirmed_employee_id)}' "
+    recruiter_filter += ")"
+    return recruiter_filter, first, safe_name
+
+
+def _recruiting_period_bounds(question):
+    """Month/year when named; otherwise current calendar year for open-ended lists."""
+    text = question or ""
+    has_period = bool(
+        re.search(
+            rf"\b({_CALENDAR_MONTHS}|20\d{{2}}|this\s+month|this\s+year|last\s+month)\b",
+            text,
+            re.IGNORECASE,
+        )
+    )
+    if has_period:
+        return extract_period_bounds(question)
+    y = date.today().year
+    return f"{y}-01-01", f"{y + 1}-01-01"
+
+
+def build_datavista_stage_counts_sql(
+    question,
+    confirmed_username=None,
+    confirmed_employee_id=None,
+):
+    """
+    Deterministic one-row COUNT columns for multi-stage recruiting asks
+    (e.g. interviews + hires + submits) — avoids LLM 42000 syntax errors.
+    """
+    stages = requested_datavista_stages(question)
+    if len(stages) < 2:
+        return None
+
+    name = (confirmed_username or "").strip()
+    if not name:
+        hints = extract_name_hints(question)
+        if not hints:
+            return None
+        name = " ".join(hints)
+
+    start_iso, end_iso = _recruiting_period_bounds(question)
+    datavista_db = get_datavista_database_name()
+    recruiter_filter, _, _ = _datavista_recruiter_filter(name, confirmed_employee_id)
+
+    select_parts = []
+    for stage in stages:
+        table, date_col = _STAGE_TABLE_DATE[stage]
+        if stage == "rejects":
+            # Rejects can be internal or external date.
+            date_pred = (
+                f"("
+                f"(TRY_CONVERT(date, INTERNALREJECTDATE) >= '{start_iso}' "
+                f"AND TRY_CONVERT(date, INTERNALREJECTDATE) < '{end_iso}') "
+                f"OR (TRY_CONVERT(date, EXTERNALREJECTDATE) >= '{start_iso}' "
+                f"AND TRY_CONVERT(date, EXTERNALREJECTDATE) < '{end_iso}')"
+                f")"
+            )
+        else:
+            date_pred = (
+                f"TRY_CONVERT(date, {date_col}) >= '{start_iso}' "
+                f"AND TRY_CONVERT(date, {date_col}) < '{end_iso}'"
+            )
+        select_parts.append(
+            f"(SELECT COUNT(*) FROM [{datavista_db}].[dbo].[{table}] "
+            f"WHERE {date_pred} AND {recruiter_filter}) AS {stage}"
+        )
+
+    return "SELECT " + ", ".join(select_parts)
 
 
 def extract_month_year_bounds(question):
@@ -2203,8 +2364,10 @@ def extract_requested_metric_order(question):
         ("aafs", re.compile(r"\baafs\b", re.I)),
         ("submittals", re.compile(r"\bsubmitt?als?\b|\bsubmits?\b", re.I)),
         ("interviews", re.compile(r"\binterviews?\b", re.I)),
+        ("hires", re.compile(r"\bhires?\b|\bhired\b", re.I)),
         ("offers", re.compile(r"\boffers?\b", re.I)),
         ("starts", re.compile(r"\bstarts?\b", re.I)),
+        ("rejects", re.compile(r"\brejects?\b|\brejected\b", re.I)),
     ]
 
     matches = []
@@ -2275,8 +2438,14 @@ def _metric_bucket_for_column(col_name):
         return "submittals"
     if "interview" in key:
         return "interviews"
-    if "offer" in key or "placement" in key or "hire" in key:
+    if key in {"hires", "hire", "hirecount"} or (
+        "hire" in key and "interview" not in key
+    ):
+        return "hires"
+    if "offer" in key or "placement" in key:
         return "offers"
+    if key in {"rejects", "reject", "rejectcount"} or "reject" in key:
+        return "rejects"
     if key in {"starts", "start", "startdate"} or (
         "start" in key and "login" not in key
     ):
@@ -2342,7 +2511,7 @@ def _friendly_display_name(col_name, bucket=None, question=None):
 
 
 def order_result_columns(results, question=None):
-    """Date/month leftmost, then metrics in ask-order, then the rest."""
+    """Date/month leftmost, then logged hours / time metrics, then ask-order, then rest."""
     if not results:
         return results
 
@@ -2359,7 +2528,6 @@ def order_result_columns(results, question=None):
         if _metric_bucket_for_column(k) == "date"
         or _norm_col(k) in {"sessiondate", "date", "workdate"}
     ]
-    is_monthy = bool(month_keys) or bool(month_breakdown_guidance(question))
 
     preferred = []
     seen = set()
@@ -2369,36 +2537,54 @@ def order_result_columns(results, question=None):
             preferred.append(key)
             seen.add(key)
 
-    # Date or month always on the left.
-    if is_monthy:
-        for key in month_keys:
-            _add(key)
+    # Date or month always on the far left.
+    for key in month_keys:
+        _add(key)
     for key in date_keys:
         _add(key)
 
+    # Time metrics next — logged hours first, then other time fields in ask order.
+    time_metrics = ("logged_hours", "avg_logged_hours", "break", "avg_break")
+    for metric in time_metrics:
+        if metric in metric_order or metric == "logged_hours":
+            for key in keys:
+                if _metric_bucket_for_column(key) == metric:
+                    _add(key)
+    for metric in metric_order:
+        if metric in time_metrics:
+            for key in keys:
+                if _metric_bucket_for_column(key) == metric:
+                    _add(key)
+
+    # Remaining metrics in the order asked.
     for metric in metric_order:
         for key in keys:
             if _metric_bucket_for_column(key) == metric:
                 _add(key)
 
     for name in (
-        "userName",
-        "username",
-        "employeeid",
         "logged_hours",
         "total_break",
         "avg_logged_hours",
         "avg_break",
+        "userName",
+        "username",
+        "employeeid",
         "present_days",
         "halfday_days",
         "absent_days",
+        "submittals",
+        "interviews",
+        "hires",
+        "offers",
+        "starts",
+        "rejects",
     ):
         for key in keys:
             if key.lower() == name.lower():
                 _add(key)
 
     for key in keys:
-        # Never surface a bare duration column ahead of named metrics.
         if _norm_col(key) == "duration":
             continue
         _add(key)
@@ -5055,6 +5241,12 @@ def ask_question():
             confirmed_employee_id=confirmed_employee_id,
             primary_table=primary_table,
         )
+        if not sql_query:
+            sql_query = build_datavista_stage_counts_sql(
+                question,
+                confirmed_username=confirmed_username,
+                confirmed_employee_id=confirmed_employee_id,
+            )
         if not sql_query:
             sql_query = build_attendance_day_count_sql(
                 question,

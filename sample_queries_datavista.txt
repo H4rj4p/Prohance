@@ -1,3 +1,19 @@
+-- Multi-stage counts for one recruiter (interviews + hires + submittals)
+-- Prefer scalar COUNT subqueries — never UNION for side-by-side counts.
+SELECT
+  (SELECT COUNT(*) FROM DataVista.dbo.CR_InterviewMaster
+   WHERE TRY_CONVERT(date, INTERVIEWDATE) >= '2026-01-01'
+     AND TRY_CONVERT(date, INTERVIEWDATE) < '2027-01-01'
+     AND (PRIMARYRECRUITERNAME LIKE 'Akshay%' OR USERFIRSTNAME = 'Akshay')) AS interviews,
+  (SELECT COUNT(*) FROM DataVista.dbo.CR_HireMaster
+   WHERE TRY_CONVERT(date, PLACEMENTDATE) >= '2026-01-01'
+     AND TRY_CONVERT(date, PLACEMENTDATE) < '2027-01-01'
+     AND (PRIMARYRECRUITERNAME LIKE 'Akshay%' OR USERFIRSTNAME = 'Akshay')) AS hires,
+  (SELECT COUNT(*) FROM DataVista.dbo.CR_SubmittalMaster
+   WHERE TRY_CONVERT(date, SUBMITTALDATE) >= '2026-01-01'
+     AND TRY_CONVERT(date, SUBMITTALDATE) < '2027-01-01'
+     AND (PRIMARYRECRUITERNAME LIKE 'Akshay%' OR USERFIRSTNAME = 'Akshay')) AS submittals;
+
 -- Hires this month
 SELECT TOP (50)
   CANDIDATEFIRSTNAME,
@@ -11,6 +27,7 @@ SELECT TOP (50)
 FROM DataVista.dbo.CR_HireMaster
 WHERE TRY_CONVERT(date, PLACEMENTDATE) >= DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1)
 ORDER BY TRY_CONVERT(date, PLACEMENTDATE) DESC;
+
 
 -- Candidates recruited / worked by a user (search all stages)
 SELECT TOP (100)

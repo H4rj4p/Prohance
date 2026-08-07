@@ -72,6 +72,10 @@ Rules:
    WHERE <recruiter filter> AND SUBMITTALDATE in range.
    Return ONLY the count — not interview/hire detail rows.
 5. Same pattern for interviews / hires / rejects with their own table + date column.
+5b. Multiple stages in one ask ("interviews, hires and submits for X"):
+   ONE SELECT with scalar COUNT(*) subqueries as separate columns
+   (interviews, hires, submittals) — never UNION, never invent JOINs across stages.
+   Column order matches the question. Use TRY_CONVERT(date, ...) for date filters.
 6. Only if the stage is not specified, UNION ALL across all four CR_* tables with a Stage column.
 7. For "how many clients/companies", COUNT(DISTINCT COMPANYNAME).
 8. Mixed "performance" (submits + interviews + offers + starts + avg logged hours):
