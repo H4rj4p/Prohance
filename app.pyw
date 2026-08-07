@@ -1059,7 +1059,9 @@ def enhance_for_sql(question, history=None, domain=None):
             "Only change what the user newly asked for (e.g. average instead of list, "
             "or ADD newly excluded weekdays on top of earlier exclusions). "
             "If weekends were already excluded and the user now excludes Fridays, "
-            "keep Saturday/Sunday out AND also exclude Friday."
+            "keep Saturday/Sunday out AND also exclude Friday. "
+            "CRITICAL: Write fresh SQL and recalculate the number. "
+            "Do not copy the previous answer's hours/average unchanged."
         )
 
     # Mixed recruiting + attendance performance questions.
@@ -1119,9 +1121,11 @@ def enhance_for_answer(question):
         )
     ):
         base += (
-            " This is a filter follow-up. Report the same metric with the exclusion applied. "
-            "Do NOT say you couldn't find Fridays/weekends as a field — those are day filters, "
-            "not data columns."
+            " This is a filter follow-up that recalculated the metric. "
+            "State the new average/total and which days were excluded "
+            "(for example: excluding Saturdays, Sundays, and Fridays). "
+            "Do NOT repeat an earlier number if the data shows a different value. "
+            "Do NOT say you couldn't find Fridays/weekends as a field — those are day filters."
         )
     if not is_multi_part(question):
         return (question or "") + base
@@ -3431,11 +3435,25 @@ def _extract_exclusion_flags(text):
     return exclude_weekends, exclude_weekdays, excluded_days
 
 
-def exclusion_sql_guidance(question, history=None):
-    """Translate excluding weekends/weekdays/Monday into SQL DATENAME filters."""
-    texts = [question or ""]
-    # Stack exclusions across follow-ups (weekends, then later Fridays).
-    if is_continuation_followup(question) and history:
+def collect_excluded_weekdays(question, history=None):
+    """
+    Stacked weekday names to exclude from this turn + prior user follow-ups.
+    Returns (excluded_day_labels, weekends_only_mode).
+    weekends_only_mode means "exclude weekdays" (keep Sat/Sun only).
+    """
+    texts = []
+    current = question or ""
+    if current.strip():
+        texts.append(current)
+
+    if history and (
+        is_continuation_followup(current)
+        or re.search(
+            r"\b(exclud|without|except|omit|remove|skip|avg|average|total)\b",
+            current,
+            re.IGNORECASE,
+        )
+    ):
         for item in history:
             if str(item.get("role") or "").lower() != "user":
                 continue
@@ -3459,19 +3477,37 @@ def exclusion_sql_guidance(question, history=None):
             if day not in excluded_days:
                 excluded_days.append(day)
 
-    if not (exclude_weekends or exclude_weekdays or excluded_days):
-        return None
-
     if exclude_weekends:
         for day in ("Saturday", "Sunday"):
             if day not in excluded_days:
                 excluded_days.append(day)
 
+    weekends_only = bool(exclude_weekdays and not excluded_days)
+    return excluded_days, weekends_only
+
+
+def exclusion_sql_guidance(question, history=None):
+    """Translate excluding weekends/weekdays/Monday into SQL DATENAME filters."""
+    excluded_days, weekends_only = collect_excluded_weekdays(question, history)
+    current_has_exclusion = bool(
+        re.search(
+            r"\b(exclud(?:e|ing|ed)|without|except|omit|remove|skip)\b",
+            question or "",
+            re.IGNORECASE,
+        )
+    )
+    if not excluded_days and not weekends_only:
+        return None
+    if not current_has_exclusion and not is_continuation_followup(question):
+        return None
+
     notes = [
         "EXCLUSION FILTER: Use DATENAME(WEEKDAY, sessionDate) for day-of-week filters "
-        "(do not use DATEPART weekday numbers — they depend on DATEFIRST and are wrong)."
+        "(do not use DATEPART weekday numbers — they depend on DATEFIRST and are wrong). "
+        "You MUST recalculate the aggregate with this filter in SQL — "
+        "never reuse or repeat the previous numeric answer."
     ]
-    if exclude_weekdays and not excluded_days:
+    if weekends_only:
         notes.append(
             "Exclude weekdays: AND DATENAME(WEEKDAY, sessionDate) IN ('Saturday', 'Sunday')."
         )
@@ -3482,6 +3518,198 @@ def exclusion_sql_guidance(question, history=None):
             f"AND DATENAME(WEEKDAY, sessionDate) NOT IN ({listed})."
         )
     return " ".join(notes)
+
+
+def _prior_sql_from_context(history=None, last_result=None):
+    if isinstance(last_result, dict):
+        query = str(last_result.get("query") or "").strip()
+        if query and query.upper() != "NA":
+            return query
+    for item in reversed(history or []):
+        content = str(item.get("content") or "")
+        match = re.search(r"SQL:\s*(SELECT[\s\S]+)$", content, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+        if re.search(r"\bsessionDate\b", content, re.IGNORECASE):
+            match = re.search(r"(SELECT[\s\S]+)", content, re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+    return ""
+
+
+def _extract_username_from_sql(sql):
+    if not sql:
+        return None
+    match = re.search(r"\buserName\b\s+LIKE\s+'([^']+)'", sql, re.IGNORECASE)
+    if match:
+        return match.group(1).rstrip("%").strip() or None
+    match = re.search(r"\buserName\b\s*=\s*'([^']+)'", sql, re.IGNORECASE)
+    if match:
+        return match.group(1).strip() or None
+    return None
+
+
+def _extract_date_bounds_from_sql(sql):
+    if not sql:
+        return None
+    match = re.search(
+        r"\bsessionDate\b\s*>=\s*'(\d{4}-\d{2}-\d{2})'[\s\S]*?"
+        r"\bsessionDate\b\s*<\s*'(\d{4}-\d{2}-\d{2})'",
+        sql,
+        re.IGNORECASE,
+    )
+    if match:
+        return match.group(1), match.group(2)
+    match = re.search(
+        r"\bsessionDate\b\s+BETWEEN\s+'(\d{4}-\d{2}-\d{2})'\s+AND\s+'(\d{4}-\d{2}-\d{2})'",
+        sql,
+        re.IGNORECASE,
+    )
+    if match:
+        return match.group(1), match.group(2)
+    return None
+
+
+def _person_from_history_questions(history):
+    for item in history or []:
+        if str(item.get("role") or "").lower() != "user":
+            continue
+        hints = extract_name_hints(item.get("content") or "")
+        if hints:
+            return " ".join(hints)
+    return None
+
+
+def _date_bounds_from_history(history, question):
+    for item in history or []:
+        if str(item.get("role") or "").lower() != "user":
+            continue
+        content = str(item.get("content") or "")
+        if re.search(
+            rf"\b({_NAME_MONTHS}|this\s+month|this\s+year)\b",
+            content,
+            re.IGNORECASE,
+        ):
+            return extract_month_year_bounds(content)
+    return extract_month_year_bounds(question)
+
+
+def wants_average_hours_metric(question, history=None, prior_sql=""):
+    text = question or ""
+    if re.search(r"\b(avg|average)\b", text, re.IGNORECASE):
+        return True
+    if re.search(r"\bavg_seconds\b", prior_sql or "", re.IGNORECASE):
+        return True
+    for item in reversed(history or []):
+        content = str(item.get("content") or "")
+        role = str(item.get("role") or "").lower()
+        if role == "user" and re.search(r"\b(avg|average)\b", content, re.IGNORECASE):
+            return True
+        if role == "assistant" and re.search(
+            r"\bavg_seconds\b|\baveraged\b|\baverage\b", content, re.IGNORECASE
+        ):
+            return True
+    return False
+
+
+def is_hours_followup_question(question, history=None, last_result=None):
+    """Avg / exclusion follow-ups on a prior logged-hours thread."""
+    if not is_continuation_followup(question):
+        return False
+    if is_mixed_performance_question(question):
+        return False
+
+    text = question or ""
+    asks_hours_metric = bool(
+        re.search(
+            r"\b(avg|average|total|sum|logged\s*hours?|hours?|"
+            r"exclud|without|except|omit|remove|skip|weekend|weekday|"
+            r"monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+            text,
+            re.IGNORECASE,
+        )
+    )
+    if not asks_hours_metric:
+        return False
+
+    blob_parts = [text]
+    if isinstance(last_result, dict):
+        blob_parts.append(str(last_result.get("query") or ""))
+        blob_parts.append(str(last_result.get("question") or ""))
+    for item in history or []:
+        blob_parts.append(str(item.get("content") or ""))
+    blob = "\n".join(blob_parts)
+    return bool(
+        re.search(
+            r"\b(logged_hours|sessionDate|avg_seconds|total_seconds|"
+            r"logged\s*hours?|EmployeeAttendance)\b",
+            blob,
+            re.IGNORECASE,
+        )
+    )
+
+
+def build_prohance_hours_followup_sql(
+    question,
+    history=None,
+    last_result=None,
+    confirmed_username=None,
+    primary_table=None,
+):
+    """
+    Deterministic AVG/SUM logged_hours SQL for follow-ups, including day exclusions.
+    Forces a fresh recalculation so "excluding Friday" cannot reuse the prior number.
+    """
+    if not is_hours_followup_question(question, history, last_result):
+        return None
+
+    prior_sql = _prior_sql_from_context(history, last_result)
+    person = (confirmed_username or "").strip()
+    if not person:
+        person = _person_from_history_questions(history) or _extract_username_from_sql(
+            prior_sql
+        )
+    if not person:
+        return None
+
+    bounds = _extract_date_bounds_from_sql(prior_sql)
+    if not bounds:
+        bounds = _date_bounds_from_history(history, question)
+    start_iso, end_iso = bounds
+
+    excluded_days, weekends_only = collect_excluded_weekdays(question, history)
+    use_avg = wants_average_hours_metric(question, history, prior_sql)
+
+    table_name = primary_table or (
+        schema_provider.get_primary_table_name() if "schema_provider" in globals() else None
+    ) or "EmployeeAttendance"
+    db_name = get_connected_database_name()
+    from_table = f"[{db_name}].[dbo].[{table_name}]" if db_name else f"[{table_name}]"
+
+    safe_person = sql_literal(person)
+    first = sql_literal(person.split()[0]) if person.split() else safe_person
+    seconds_expr = (
+        "COALESCE(DATEDIFF(SECOND, 0, "
+        "TRY_CAST(NULLIF(LTRIM(RTRIM(logged_hours)), '') AS TIME)), 0)"
+    )
+    if use_avg:
+        select_expr = f"CAST(ROUND(AVG({seconds_expr}), 0) AS int) AS avg_seconds"
+    else:
+        select_expr = f"CAST(SUM({seconds_expr}) AS int) AS total_seconds"
+
+    where_parts = [
+        f"(userName = '{safe_person}' OR userName LIKE '{safe_person}%' "
+        f"OR userName LIKE '{first}%')",
+        f"sessionDate >= '{start_iso}'",
+        f"sessionDate < '{end_iso}'",
+    ]
+    if weekends_only:
+        where_parts.append("DATENAME(WEEKDAY, sessionDate) IN ('Saturday', 'Sunday')")
+    elif excluded_days:
+        listed = ", ".join(f"'{d}'" for d in excluded_days)
+        where_parts.append(f"DATENAME(WEEKDAY, sessionDate) NOT IN ({listed})")
+
+    return f"SELECT {select_expr} FROM {from_table} WHERE " + " AND ".join(where_parts)
 
 
 def month_breakdown_guidance(question):
@@ -4009,6 +4237,14 @@ def ask_question():
             primary_table=primary_table,
         )
         if not sql_query:
+            sql_query = build_prohance_hours_followup_sql(
+                question,
+                history=history,
+                last_result=last_result,
+                confirmed_username=confirmed_username,
+                primary_table=primary_table,
+            )
+        if not sql_query:
             sql_query = generate_sql(
                 question,
                 history,
@@ -4017,6 +4253,25 @@ def ask_question():
                 confirmed_employee_id,
                 domain=domain,
             )
+        # If LLM omitted day exclusions on an hours follow-up, force deterministic SQL.
+        if (
+            domain == "prohance"
+            and is_hours_followup_question(question, history, last_result)
+            and collect_excluded_weekdays(question, history)[0]
+            and not re.search(r"\bDATENAME\s*\(\s*WEEKDAY", sql_query or "", re.I)
+        ):
+            rebuilt = build_prohance_hours_followup_sql(
+                question,
+                history=history,
+                last_result=last_result,
+                confirmed_username=confirmed_username
+                or _extract_username_from_sql(sql_query)
+                or _person_from_history_questions(history),
+                primary_table=primary_table,
+            )
+            if rebuilt:
+                sql_query = rebuilt
+
         sql_query = clean_sql(sql_query, primary_table or "EmployeeAttendance")
         sql_query = remove_broad_query_limit(sql_query, question)
         sql_query = ensure_single_readonly_sql(sql_query)
