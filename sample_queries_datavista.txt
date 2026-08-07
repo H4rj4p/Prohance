@@ -1,3 +1,19 @@
+-- Multi-stage counts for one recruiter (interviews + hires + submittals)
+-- Prefer scalar COUNT subqueries — never UNION for side-by-side counts.
+SELECT
+  (SELECT COUNT(*) FROM DataVista.dbo.CR_InterviewMaster
+   WHERE TRY_CONVERT(date, INTERVIEWDATE) >= '2026-01-01'
+     AND TRY_CONVERT(date, INTERVIEWDATE) < '2027-01-01'
+     AND (PRIMARYRECRUITERNAME LIKE 'Akshay%' OR USERFIRSTNAME = 'Akshay')) AS interviews,
+  (SELECT COUNT(*) FROM DataVista.dbo.CR_HireMaster
+   WHERE TRY_CONVERT(date, PLACEMENTDATE) >= '2026-01-01'
+     AND TRY_CONVERT(date, PLACEMENTDATE) < '2027-01-01'
+     AND (PRIMARYRECRUITERNAME LIKE 'Akshay%' OR USERFIRSTNAME = 'Akshay')) AS hires,
+  (SELECT COUNT(*) FROM DataVista.dbo.CR_SubmittalMaster
+   WHERE TRY_CONVERT(date, SUBMITTALDATE) >= '2026-01-01'
+     AND TRY_CONVERT(date, SUBMITTALDATE) < '2027-01-01'
+     AND (PRIMARYRECRUITERNAME LIKE 'Akshay%' OR USERFIRSTNAME = 'Akshay')) AS submittals;
+
 -- Hires this month
 SELECT TOP (50)
   CANDIDATEFIRSTNAME,
@@ -11,6 +27,7 @@ SELECT TOP (50)
 FROM DataVista.dbo.CR_HireMaster
 WHERE TRY_CONVERT(date, PLACEMENTDATE) >= DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1)
 ORDER BY TRY_CONVERT(date, PLACEMENTDATE) DESC;
+
 
 -- Candidates recruited / worked by a user (search all stages)
 SELECT TOP (100)
@@ -73,17 +90,81 @@ WHERE NULLIF(LTRIM(RTRIM(COMPANYNAME)), '') IS NOT NULL
    OR NULLIF(LTRIM(RTRIM(AGREEDPAYRATE)), '') IS NOT NULL
 ORDER BY Stage;
 
--- How many submittals did someone make this month?
+-- Month-by-month submittals this year (month NAME only — no month_num column)
+SELECT
+  DATENAME(month, TRY_CONVERT(date, SUBMITTALDATE)) AS month,
+  COUNT(*) AS submittal_count
+FROM DataVista.dbo.CR_SubmittalMaster
+WHERE TRY_CONVERT(date, SUBMITTALDATE) >= DATEFROMPARTS(YEAR(GETDATE()), 1, 1)
+  AND TRY_CONVERT(date, SUBMITTALDATE) < DATEFROMPARTS(YEAR(GETDATE()) + 1, 1, 1)
+  AND (
+    PRIMARYRECRUITERNAME LIKE 'Disha%'
+    OR USERFIRSTNAME = 'Disha'
+  )
+GROUP BY
+  DATENAME(month, TRY_CONVERT(date, SUBMITTALDATE)),
+  MONTH(TRY_CONVERT(date, SUBMITTALDATE)),
+  YEAR(TRY_CONVERT(date, SUBMITTALDATE))
+ORDER BY YEAR(TRY_CONVERT(date, SUBMITTALDATE)), MONTH(TRY_CONVERT(date, SUBMITTALDATE));
+
+-- July performance: submits, interviews, offers, starts + avg logged hours
+-- Replace Prohance DB/table with the connected attendance database/table.
+SELECT
+  (SELECT COUNT(*)
+   FROM DataVista.dbo.CR_SubmittalMaster
+   WHERE TRY_CONVERT(date, SUBMITTALDATE) >= '2026-07-01'
+     AND TRY_CONVERT(date, SUBMITTALDATE) < '2026-08-01'
+     AND (PRIMARYRECRUITERNAME LIKE 'Disha%' OR USERFIRSTNAME = 'Disha')
+  ) AS submittals,
+  (SELECT COUNT(*)
+   FROM DataVista.dbo.CR_InterviewMaster
+   WHERE TRY_CONVERT(date, INTERVIEWDATE) >= '2026-07-01'
+     AND TRY_CONVERT(date, INTERVIEWDATE) < '2026-08-01'
+     AND (PRIMARYRECRUITERNAME LIKE 'Disha%' OR USERFIRSTNAME = 'Disha')
+  ) AS interviews,
+  (SELECT COUNT(*)
+   FROM DataVista.dbo.CR_HireMaster
+   WHERE TRY_CONVERT(date, PLACEMENTDATE) >= '2026-07-01'
+     AND TRY_CONVERT(date, PLACEMENTDATE) < '2026-08-01'
+     AND (PRIMARYRECRUITERNAME LIKE 'Disha%' OR USERFIRSTNAME = 'Disha')
+  ) AS offers,
+  (SELECT COUNT(*)
+   FROM DataVista.dbo.CR_HireMaster
+   WHERE TRY_CONVERT(date, STARTDATE) >= '2026-07-01'
+     AND TRY_CONVERT(date, STARTDATE) < '2026-08-01'
+     AND (PRIMARYRECRUITERNAME LIKE 'Disha%' OR USERFIRSTNAME = 'Disha')
+  ) AS starts,
+  (SELECT CAST(ROUND(AVG(
+      COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(logged_hours)), '') AS TIME)), 0)
+    ), 0) AS int)
+   FROM EmployeeAttendance
+   WHERE userName LIKE 'Disha%'
+     AND sessionDate >= '2026-07-01'
+     AND sessionDate < '2026-08-01'
+  ) AS avg_logged_seconds;
+
+-- How many submittals did a recruiter make this month? (COUNT only — no UNION)
 SELECT COUNT(*) AS submittal_count
 FROM DataVista.dbo.CR_SubmittalMaster
 WHERE TRY_CONVERT(date, SUBMITTALDATE) >= DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1)
   AND (
-    PRIMARYRECRUITERNAME LIKE '%Jordan%'
-    OR (USERFIRSTNAME LIKE '%Jordan%' AND USERLASTNAME LIKE '%Lee%')
-    OR (USERFIRSTNAME + ' ' + USERLASTNAME) LIKE '%Jordan%Lee%'
+    PRIMARYRECRUITERNAME = 'Disha'
+    OR PRIMARYRECRUITERNAME LIKE 'Disha %'
+    OR USERFIRSTNAME = 'Disha'
+    OR (USERFIRSTNAME + ' ' + USERLASTNAME) LIKE 'Disha %'
   );
 
--- Submittal pay rate + company (when question says submittal)
+-- How many submittals in July 2026 for a recruiter
+SELECT COUNT(*) AS submittal_count
+FROM DataVista.dbo.CR_SubmittalMaster
+WHERE TRY_CONVERT(date, SUBMITTALDATE) >= '2026-07-01'
+  AND TRY_CONVERT(date, SUBMITTALDATE) < '2026-08-01'
+  AND (
+    PRIMARYRECRUITERNAME LIKE 'Jordan%'
+    OR (USERFIRSTNAME = 'Jordan' AND USERLASTNAME = 'Lee')
+  );
+
+-- Submittals list for a recruiter (only when user asks to show/list, not "how many")
 SELECT
   CANDIDATEFIRSTNAME,
   CANDIDATELASTNAME,
@@ -93,10 +174,11 @@ SELECT
   SUBMITTALDATE,
   PRIMARYRECRUITERNAME
 FROM DataVista.dbo.CR_SubmittalMaster
-WHERE CANDIDATEFIRSTNAME LIKE '%Akshay%'
+WHERE PRIMARYRECRUITERNAME LIKE 'Disha%'
+   OR USERFIRSTNAME = 'Disha'
 ORDER BY TRY_CONVERT(date, SUBMITTALDATE) DESC;
 
--- Interviews for a candidate by first name
+-- Interviews for a recruiter
 SELECT
   CANDIDATEFIRSTNAME,
   CANDIDATELASTNAME,
@@ -106,7 +188,8 @@ SELECT
   INTERVIEWFLAG,
   PRIMARYRECRUITERNAME
 FROM DataVista.dbo.CR_InterviewMaster
-WHERE CANDIDATEFIRSTNAME LIKE '%Akshay%'
+WHERE PRIMARYRECRUITERNAME LIKE 'Disha%'
+   OR USERFIRSTNAME = 'Disha'
 ORDER BY TRY_CONVERT(date, INTERVIEWDATE) DESC;
 
 -- Reject reasons this year

@@ -327,6 +327,13 @@
     let lastUserQuestion = "";
     let chartCounter = 0;
     let lastResultContext = null;
+    let activePerson = { username: null, employeeId: null };
+
+    const NAME_STOPWORDS = new Set([
+      "now", "okay", "ok", "alright", "sure", "please", "then", "also", "and", "plus",
+      "show", "list", "give", "tell", "get", "what", "who", "how", "when", "where",
+      "this", "that", "these", "those", "information", "data", "report", "summary"
+    ]);
 
     const CHART_COLORS = [
       "#19c37d", "#5436da", "#3b82f6", "#f59e0b", "#ef4444",
@@ -675,6 +682,43 @@
       chartInstances.set(canvasId, chart);
     }
 
+    function orderTableColumns(columns, preferredOrder = null) {
+      // Hard rule: month or day/date first, then ask-order from the server when given.
+      const norm = (name) => String(name || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+      const isMonth = (name) => {
+        const key = norm(name);
+        return key === "month" || key === "monthname" || key === "mon";
+      };
+      const isDate = (name) => {
+        const key = norm(name);
+        return key === "sessiondate" || key === "date" || key === "workdate" || key === "day";
+      };
+
+      if (Array.isArray(preferredOrder) && preferredOrder.length > 0) {
+        const available = new Set(columns);
+        const ordered = [];
+        preferredOrder.forEach(col => {
+          if (available.has(col)) {
+            ordered.push(col);
+            available.delete(col);
+          }
+        });
+        columns.forEach(col => {
+          if (available.has(col)) ordered.push(col);
+        });
+        // Safety: month/date first even if preferredOrder was wrong.
+        const monthCols = ordered.filter(isMonth);
+        const dateCols = ordered.filter(isDate);
+        const rest = ordered.filter(col => !isMonth(col) && !isDate(col));
+        return [...monthCols, ...dateCols, ...rest];
+      }
+
+      const monthCols = columns.filter(isMonth);
+      const dateCols = columns.filter(isDate);
+      const rest = columns.filter(col => !isMonth(col) && !isDate(col));
+      return [...monthCols, ...dateCols, ...rest];
+    }
+
     function renderTableRows(rows, columns, visibleCount) {
       return rows.slice(0, visibleCount).map(row => {
         const cells = columns.map(col =>
@@ -684,10 +728,10 @@
       }).join("");
     }
 
-    function renderDataView(rows, isHidden = false) {
+    function renderDataView(rows, isHidden = false, preferredOrder = null) {
       if (!rows || rows.length === 0) return "";
 
-      const columns = Object.keys(rows[0]);
+      const columns = orderTableColumns(Object.keys(rows[0]), preferredOrder);
       if (columns.length === 0) return "";
 
       const header = columns.map(col =>
@@ -828,10 +872,10 @@
       URL.revokeObjectURL(url);
     }
 
-    function exportRowsAsCsv(rows) {
+    function exportRowsAsCsv(rows, preferredOrder = null) {
       if (!rows || rows.length === 0) return;
 
-      const columns = Object.keys(rows[0]);
+      const columns = orderTableColumns(Object.keys(rows[0]), preferredOrder);
       const escapeCsv = value => {
         const text = formatCellValue(value);
         return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
@@ -844,14 +888,16 @@
       downloadFile("iri-ai-results.csv", lines.join("\n"), "text/csv;charset=utf-8");
     }
 
-    function loadMoreRows(row, rows) {
+    function loadMoreRows(row, rows, preferredOrder = null) {
       const tableResult = row.querySelector(".table-result");
       const tbody = tableResult?.querySelector("tbody");
       const countEl = tableResult?.querySelector(".table-count");
       const button = tableResult?.querySelector('[data-action="load-more"]');
       if (!tableResult || !tbody || !countEl) return;
 
-      const columns = rows && rows.length > 0 ? Object.keys(rows[0]) : [];
+      const columns = rows && rows.length > 0
+        ? orderTableColumns(Object.keys(rows[0]), preferredOrder)
+        : [];
       const current = Number(tableResult.dataset.visibleCount || "0");
       const next = Math.min(current + TABLE_PAGE_SIZE, rows.length);
       tbody.innerHTML = renderTableRows(rows, columns, next);
@@ -928,6 +974,7 @@
       const confirmHtml = options.needsConfirmation
         ? renderConfirmButtons(options.candidates, options.originalQuestion)
         : "";
+      const preferredOrder = Array.isArray(options.columnOrder) ? options.columnOrder : null;
 
       const resolvedChartType = options.needsConfirmation
         ? null
@@ -937,7 +984,7 @@
       const closedActionHtml = chartId ? renderClosedChartToggle(chartId, rows) : "";
       const chartFooterHtml = chartId ? renderChartFooter(chartId, chartSpec?.type || null, rows) : "";
       const chartHtml = chartId ? renderChartCanvas(chartId, false, chartFooterHtml) : "";
-      const tableHtml = renderDataView(rows, false);
+      const tableHtml = renderDataView(rows, false, preferredOrder);
       const detailsHtml = renderDetails(query, rows);
 
       row.innerHTML = `
@@ -984,12 +1031,12 @@
           }
 
           if (action === "csv") {
-            exportRowsAsCsv(rows);
+            exportRowsAsCsv(rows, preferredOrder);
             return;
           }
 
           if (action === "load-more") {
-            loadMoreRows(row, rows);
+            loadMoreRows(row, rows, preferredOrder);
             return;
           }
         });
@@ -1050,6 +1097,38 @@
       input.style.height = `${Math.min(input.scrollHeight, 160)}px`;
     }
 
+    function looksLikeNewPersonQuestion(text) {
+      // If the user names someone (capitalized token or leading name),
+      // do not attach the previous person's result context unless comparing / continuing.
+      const q = String(text || "");
+      if (/\b(compare|versus|vs\.?|both|difference between)\b/i.test(q)) return false;
+      if (/^\s*(and|also|plus|now|then|okay|ok|alright|sure|please|what about|how about|excluding|exclude|without|except)\b/i.test(q)) return false;
+      if (/\b(exclud(?:e|ing|ed)|without|except|omit|remove|skip)\b/i.test(q)
+          && /\b(weekend|weekends|weekday|weekdays|monday|tuesday|wednesday|thursday|friday|saturday|sunday)s?\b/i.test(q)) {
+        return false;
+      }
+      if (/\b(he|she|they|them|his|her|their|him|this user|same person|the other)\b/i.test(q)) {
+        return false;
+      }
+      // Leading discourse word that is not a person.
+      const leading = (q.match(/^\s*([A-Za-z][A-Za-z'.-]*)/) || [])[1];
+      if (leading && NAME_STOPWORDS.has(leading.toLowerCase())) return false;
+
+      // Leading name: "Disha how many..." / "Akshay Soni, ..."
+      if (/^\s*[A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,2}\s*[,:]?\s+(how|what|who|show|list|give|tell|did|for)\b/i.test(q)) {
+        const leadName = (q.match(/^\s*([A-Za-z][A-Za-z'.-]*)/) || [])[1];
+        if (leadName && NAME_STOPWORDS.has(leadName.toLowerCase())) return false;
+        return true;
+      }
+      if (/\b(for|did|about)\s+[A-Z][a-zA-Z'.-]+/.test(q)) return true;
+      if (/^\s*(give|show|get|tell)\s+me\s+[A-Z][a-zA-Z'.-]+/i.test(q)) {
+        const afterMe = (q.match(/^\s*(?:give|show|get|tell)\s+me\s+([A-Za-z][A-Za-z'.-]*)/i) || [])[1];
+        if (afterMe && NAME_STOPWORDS.has(afterMe.toLowerCase())) return false;
+        return true;
+      }
+      return false;
+    }
+
     async function sendQuestion(text, confirmedUsername, confirmedEmployeeId) {
       const history = chatHistory.slice(-8);
       send.disabled = true;
@@ -1062,9 +1141,17 @@
 
       try {
         const payload = { message: text, history };
-        if (lastResultContext) payload.last_result = lastResultContext;
-        if (confirmedUsername) payload.confirmed_username = confirmedUsername;
-        if (confirmedEmployeeId) payload.confirmed_employee_id = String(confirmedEmployeeId);
+        // New named person → drop prior result memory so old filters are not reused.
+        if (looksLikeNewPersonQuestion(text)) {
+          lastResultContext = null;
+          activePerson = { username: null, employeeId: null };
+        } else if (lastResultContext) {
+          payload.last_result = lastResultContext;
+        }
+        const personName = confirmedUsername || activePerson.username;
+        const personId = confirmedEmployeeId || activePerson.employeeId;
+        if (personName) payload.confirmed_username = personName;
+        if (personId) payload.confirmed_employee_id = String(personId);
 
         const res = await fetch(`${base}/api/AskQuestion`, {
           method: "POST",
@@ -1079,6 +1166,15 @@
           return;
         }
 
+        // Stick with this person for later questions until a new one is named.
+        if (data.confirmed_username) {
+          activePerson.username = data.confirmed_username;
+          activePerson.employeeId = data.confirmed_employee_id || activePerson.employeeId;
+        } else if (data.candidates && data.candidates.length === 1 && data.candidates[0].username) {
+          activePerson.username = data.candidates[0].username;
+          activePerson.employeeId = data.candidates[0].employee_id || null;
+        }
+
         if (data.error && data.answer) {
           addBotResponse(
             friendlyError(data),
@@ -1086,7 +1182,8 @@
             data.query || "",
             {
               chartType: data.chart_type || "table",
-              question: text
+              question: text,
+              columnOrder: data.column_order || null
             }
           );
           return;
@@ -1101,7 +1198,8 @@
             candidates: data.candidates || [],
             originalQuestion: text,
             question: text,
-            chartType: data.chart_type || "table"
+            chartType: data.chart_type || "table",
+            columnOrder: data.column_order || null
           }
         );
       } catch (err) {
@@ -1115,6 +1213,7 @@
 
     async function confirmEmployee(originalQuestion, username, employeeId) {
       const label = employeeId ? `${username} (ID: ${employeeId})` : username;
+      activePerson = { username, employeeId: employeeId || null };
       addUser(`Yes, ${label}`);
       await sendQuestion(originalQuestion, username, employeeId);
     }

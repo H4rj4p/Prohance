@@ -75,3 +75,73 @@ WHERE sessionDate >= DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1)
   AND sessionDate < DATEADD(month, 1, DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1))
 GROUP BY userName
 ORDER BY avg_seconds DESC;
+
+-- Logged hours over 9 hours, excluding weekends
+SELECT
+  userName,
+  sessionDate,
+  logged_hours,
+  COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(logged_hours)), '') AS TIME)), 0) AS logged_seconds
+FROM EmployeeAttendance
+WHERE sessionDate >= DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1)
+  AND COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(logged_hours)), '') AS TIME)), 0) > 9 * 3600
+  AND DATENAME(WEEKDAY, sessionDate) NOT IN ('Saturday', 'Sunday')
+ORDER BY sessionDate DESC;
+
+-- Average logged hours with same filters (follow-up style)
+SELECT
+  userName,
+  CAST(ROUND(AVG(
+    COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(logged_hours)), '') AS TIME)), 0)
+  ), 0) AS int) AS avg_seconds,
+  COUNT(*) AS session_count
+FROM EmployeeAttendance
+WHERE sessionDate >= DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1)
+  AND COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(logged_hours)), '') AS TIME)), 0) > 9 * 3600
+  AND DATENAME(WEEKDAY, sessionDate) NOT IN ('Saturday', 'Sunday')
+GROUP BY userName;
+
+-- Month-by-month logged hours for a year (return seconds; app shows HH:MM:SS)
+SELECT
+  DATENAME(month, sessionDate) AS month,
+  CAST(SUM(
+    COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(logged_hours)), '') AS TIME)), 0)
+  ) AS int) AS total_seconds
+FROM EmployeeAttendance
+WHERE userName LIKE '%Akshay%Soni%'
+  AND sessionDate >= '2026-01-01'
+  AND sessionDate < '2027-01-01'
+GROUP BY DATENAME(month, sessionDate), MONTH(sessionDate), YEAR(sessionDate)
+ORDER BY YEAR(sessionDate), MONTH(sessionDate);
+
+-- Breaks longer than 1 hour (alias total break — never "duration")
+SELECT
+  sessionDate,
+  userName,
+  CAST((
+    COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(aafsBreak)), '') AS TIME)), 0)
+    + COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(aafsLunchBreak)), '') AS TIME)), 0)
+    + COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(aafsShortBreak)), '') AS TIME)), 0)
+    + COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(aafsPersonalTime)), '') AS TIME)), 0)
+  ) AS int) AS break_seconds
+FROM EmployeeAttendance
+WHERE userName LIKE '%Akshay%'
+  AND (
+    COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(aafsBreak)), '') AS TIME)), 0)
+    + COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(aafsLunchBreak)), '') AS TIME)), 0)
+    + COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(aafsShortBreak)), '') AS TIME)), 0)
+    + COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(aafsPersonalTime)), '') AS TIME)), 0)
+  ) > 3600
+ORDER BY sessionDate DESC;
+
+-- Present / halfday / absent day counts (present >= 7h, halfday 5-7h, absent < 5h)
+SELECT
+  SUM(CASE WHEN COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(logged_hours)), '') AS TIME)), 0) >= 25200 THEN 1 ELSE 0 END) AS present_days,
+  SUM(CASE WHEN COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(logged_hours)), '') AS TIME)), 0) >= 18000
+            AND COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(logged_hours)), '') AS TIME)), 0) < 25200 THEN 1 ELSE 0 END) AS halfday_days,
+  SUM(CASE WHEN COALESCE(DATEDIFF(SECOND, 0, TRY_CAST(NULLIF(LTRIM(RTRIM(logged_hours)), '') AS TIME)), 0) < 18000 THEN 1 ELSE 0 END) AS absent_days
+FROM EmployeeAttendance
+WHERE userName LIKE '%Akshay%Soni%'
+  AND sessionDate >= DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1)
+  AND sessionDate < DATEADD(month, 1, DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1));
+
