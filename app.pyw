@@ -1049,14 +1049,17 @@ def build_month_spine_sql(start_iso, end_iso):
     still appear as rows.
     """
     values = ", ".join(
-        f"('{sql_literal(name)}', {num}, {year})"
+        f"(N'{sql_literal(name)}', {num}, {year})"
         for name, num, year in month_spine_rows(start_iso, end_iso)
     )
     return (
         "(SELECT * FROM (VALUES "
         + values
-        + ") AS spine(month, _month_num, _year_num))"
+        + ") AS spine([month], _month_num, _year_num))"
     )
+
+
+MONTHLY_CODE_VERSION = "monthly-spine-v1"
 
 
 def build_datavista_stage_counts_sql(
@@ -1191,7 +1194,7 @@ def sql_has_month_breakdown(sql):
     return bool(
         re.search(
             r"\bDATENAME\s*\(\s*month\b|_month_num\b|AS spine\b|"
-            r"VALUES\s*\(\s*'January'",
+            r"VALUES\s*\(\s*N?'January'|spine\.\[?month\]?",
             sql or "",
             re.IGNORECASE,
         )
@@ -5355,16 +5358,19 @@ def month_breakdown_guidance(question, history=None, last_result=None):
     else:
         range_note = (
             f" Date filter MUST be >= '{start_iso}' AND < '{end_iso}'. "
-            "For month-by-month / year asks with no smaller range, "
-            "cover that full period with one row per month."
+            "Build a fixed month table from January through the last month in "
+            "that period (for the current year: January through this month). "
+            "Every month row must appear even when a metric is 0."
         )
     return (
-        "MONTH BREAKDOWN: Return one row per calendar month in the date filter. "
-        "Select ONLY DATENAME(month, <date>) AS month (display name like January). "
-        "GROUP BY DATENAME(month, <date>), MONTH(<date>), YEAR(<date>) "
-        "ORDER BY YEAR(<date>), MONTH(<date>). "
-        "Do NOT select MONTH(<date>) / month_num as an output column — "
-        "users only want the month name, not a number column."
+        "MONTH BREAKDOWN (REQUIRED): Return a table with one row per month "
+        "from January through the period end (current year = through this month). "
+        "First column is month name (January, February, …). "
+        "Then fill the metrics the user asked for on each row. "
+        "Do NOT return a single total row. "
+        "Do NOT omit months with zero activity. "
+        "ORDER BY year, month number. "
+        "Do NOT select month_num as an output column."
         + order_note
         + range_note
         + " For hours/breaks return INTEGER seconds columns "
@@ -6119,8 +6125,29 @@ def ask_question():
 
         def _forced_monthly_sql(person_name):
             """Only month-by-month builders — never mixed single-row performance."""
+            if not person_name:
+                return None
+            # If the user said monthly but named no metrics, default to the
+            # common performance set + logged hours so we still return Jan…now.
+            ask_text = question
+            if not requested_datavista_stages(ask_text) and not re.search(
+                r"\b(logged\s*hours?|hours?)\b", ask_text, re.I
+            ):
+                ask_text = (
+                    f"{question} submittals interviews offers starts logged hours"
+                )
+            elif requested_datavista_stages(ask_text) and not re.search(
+                r"\b(logged\s*hours?|hours?)\b", ask_text, re.I
+            ):
+                # Keep stages; hours builder not required.
+                ask_text = question
+            elif not requested_datavista_stages(ask_text) and re.search(
+                r"\b(logged\s*hours?|hours?)\b", ask_text, re.I
+            ):
+                ask_text = question
+
             built = build_month_breakdown_with_hours_followup_sql(
-                question,
+                ask_text,
                 history=history,
                 last_result=last_result,
                 confirmed_username=person_name,
@@ -6129,7 +6156,7 @@ def ask_question():
             )
             if not built:
                 built = build_datavista_stage_counts_sql(
-                    question,
+                    ask_text,
                     confirmed_username=person_name,
                     confirmed_employee_id=confirmed_employee_id,
                     history=history,
@@ -6137,27 +6164,52 @@ def ask_question():
                 )
             if not built:
                 built = build_month_breakdown_hours_sql(
-                    question,
+                    ask_text,
                     confirmed_username=person_name,
                     confirmed_employee_id=confirmed_employee_id,
                     primary_table=primary_table,
                     history=history,
                     last_result=last_result,
                 )
+            # Last resort: force performance stages + hours month table.
+            if not built:
+                forced_q = (
+                    f"{question} monthly submittals interviews offers starts "
+                    f"logged hours"
+                )
+                built = build_month_breakdown_with_hours_followup_sql(
+                    forced_q,
+                    history=history,
+                    last_result=last_result,
+                    confirmed_username=person_name,
+                    confirmed_employee_id=confirmed_employee_id,
+                    primary_table=primary_table,
+                )
             return built
 
+        monthly_meta = {
+            "monthly_table": bool(month_mode),
+            "code_version": MONTHLY_CODE_VERSION,
+        }
+
         if month_mode:
-            # CRITICAL: monthly / month-by-month must never use mixed performance
-            # (that path returns one row: submittals/interviews/offers/starts/avg).
+            # CRITICAL: monthly / month-by-month must NEVER use mixed performance
+            # or LLM one-row totals (submittals/interviews/offers/starts/avg).
             sql_query = _forced_monthly_sql(person_for_sql)
             if not sql_query:
-                sql_query = generate_sql(
-                    question,
-                    history,
-                    primary_table,
-                    confirmed_username or person_for_sql,
-                    confirmed_employee_id,
-                    domain=domain,
+                return jsonify(
+                    {
+                        "query": "",
+                        "answer": (
+                            "For a monthly table (January through this month) I need "
+                            "the person's name. Ask like: monthly submits and logged "
+                            "hours for Akshay for 26."
+                        ),
+                        "data": [],
+                        "chart_type": "table",
+                        "domain": domain,
+                        **monthly_meta,
+                    }
                 )
         else:
             sql_query = build_mixed_performance_sql(
@@ -6260,6 +6312,22 @@ def ask_question():
                 sql_query = fix_prohance_object_names(
                     sql_query, table_name=primary_table or "EmployeeAttendance"
                 )
+
+        if month_mode and not sql_has_month_breakdown(sql_query or ""):
+            return jsonify(
+                {
+                    "query": sql_query or "",
+                    "answer": (
+                        "I couldn't build the monthly January–current-month table. "
+                        "Restart the app from branch cursor/monthly-breakdown-b10b "
+                        f"({MONTHLY_CODE_VERSION}) and ask again with the person name."
+                    ),
+                    "data": [],
+                    "chart_type": "table",
+                    "domain": domain,
+                    **monthly_meta,
+                }
+            )
 
         if sql_query.upper() == "NA":
             return jsonify(
