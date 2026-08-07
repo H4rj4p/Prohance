@@ -96,6 +96,10 @@ When asked about breaks / break time / average break / total breaks:
 ## Response style
 For duration totals, prefer human wording from the duration field
 (e.g. "1 day 3 hours", "2 weeks 23 hours and 10 minutes"), not clock HH:MM:SS.
+The app adds one `duration` label from seconds / logged_hours — do not SELECT
+multiple aliases for the same hours value
+(logged_hours + logged_duration + duration + logged_hours_duration).
+For day lists: return logged_hours (and identity/date columns); the app adds duration.
 After the query runs, answer in 1-2 short natural sentences first, e.g.
 "Akshay Soni averaged 08:15:00 logged hours this month across 18 sessions."
 Never invent values. If no rows, say no matching records were found.

@@ -2109,47 +2109,96 @@ def _is_duration_label_column(name):
 
 def enrich_duration_results(results):
     """
-    Add human-readable duration fields so totals > 24h don't look like clock times.
-    Prefers *_seconds columns; also formats HH:MM:SS duration aggregates.
+    Add one human-readable `duration` field and drop redundant clones.
+
+    Users should see logged_hours + duration — not also logged_seconds,
+    logged_duration, logged_hours_duration, etc.
     """
     if not results:
         return results
 
+    def _norm(name):
+        return re.sub(r"[^a-z0-9]+", "", (name or "").lower())
+
+    redundant_norms = {
+        "loggedduration",
+        "loggedhoursduration",
+        "loggedhourduration",
+        "totalduration",
+        "avgduration",
+        "averageduration",
+        "hourduration",
+        "hoursduration",
+        "durationhours",
+        "loggedhoursseconds",
+    }
+
     enriched = []
     for row in results:
-        new_row = dict(row)
-        for key, value in list(row.items()):
-            label_key = None
-            seconds = None
+        readable = None
 
-            if _is_seconds_column(key) and value is not None:
-                try:
-                    seconds = float(value)
-                except (TypeError, ValueError):
-                    seconds = None
-                if seconds is not None:
-                    base = re.sub(r"_?seconds?$", "", key, flags=re.IGNORECASE)
-                    label_key = f"{base}_duration" if base and base != key else "duration"
+        # Prefer integer seconds columns for totals/averages that can exceed 24h.
+        for key, value in row.items():
+            if not _is_seconds_column(key) or value is None:
+                continue
+            try:
+                readable = format_duration_seconds(float(value))
+            except (TypeError, ValueError):
+                readable = None
+            if readable:
+                break
 
-            elif value is not None and _is_duration_label_column(key):
+        # Fall back to HH:MM:SS fields like logged_hours.
+        if not readable:
+            for key, value in row.items():
+                if not _is_duration_label_column(key) or value is None:
+                    continue
+                # Skip keys that are already human labels (contain no clock pattern).
                 seconds = parse_hhmmss_to_seconds(value)
-                if seconds is not None:
-                    # Keep original clock string only when under 24h; always add readable label.
-                    label_key = f"{key}_duration" if not key.lower().endswith("duration") else key
+                if seconds is None:
+                    continue
+                readable = format_duration_seconds(seconds)
+                if readable:
+                    break
 
-            if seconds is None or label_key is None:
+        cleaned = {}
+        for key, value in row.items():
+            key_n = _norm(key)
+            # Hide seconds helpers from the table UI.
+            if _is_seconds_column(key):
                 continue
+            # Hide duplicate *duration aliases; keep a single `duration`.
+            if key_n != "duration" and (
+                key_n.endswith("duration") or key_n in redundant_norms
+            ):
+                continue
+            cleaned[key] = value
 
-            readable = format_duration_seconds(seconds)
-            if not readable:
-                continue
-            new_row[label_key] = readable
-            # For second totals, also expose a friendly primary label when missing.
-            if _is_seconds_column(key) and "duration" not in {
-                str(k).lower() for k in new_row.keys()
-            }:
-                new_row["duration"] = readable
-        enriched.append(new_row)
+        if readable:
+            cleaned["duration"] = readable
+
+        # Stable-ish column order: identity/date, logged_hours, duration, then rest.
+        preferred = []
+        seen = set()
+        for name in (
+            "userName",
+            "username",
+            "employeeid",
+            "sessionDate",
+            "sessiondate",
+            "logged_hours",
+            "duration",
+        ):
+            for key in list(cleaned.keys()):
+                if key.lower() == name.lower() and key not in seen:
+                    preferred.append(key)
+                    seen.add(key)
+        ordered = {key: cleaned[key] for key in preferred}
+        for key, value in cleaned.items():
+            if key not in seen:
+                ordered[key] = value
+
+        enriched.append(ordered)
     return enrich_month_name_results(enriched)
 
 
@@ -3877,7 +3926,11 @@ def generate_sql(
             "For SUM/total of durations (month/week totals), return total_seconds as an integer. "
             "Do NOT CONVERT seconds back to TIME/varchar HH:MM:SS — TIME wraps at 24 hours. "
             "If the user asks for an average, the SQL MUST include AVG(...) and GROUP BY when needed, "
-            "and should return avg_seconds (integer), not a TIME string."
+            "and should return avg_seconds (integer), not a TIME string. "
+            "For day-by-day logged hours lists, SELECT logged_hours once "
+            "(optionally logged_seconds for ORDER BY only). "
+            "Do NOT also select duration / logged_duration / logged_hours_duration aliases — "
+            "the app adds a single duration label."
         )
 
     raw = get_openai_completion(
