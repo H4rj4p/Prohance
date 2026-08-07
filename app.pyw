@@ -552,6 +552,9 @@ NAME_STOPWORDS = {
     "login", "logins", "logout", "late", "early", "shift", "shifts", "location",
     "locations", "session", "sessions", "attendance", "activity", "activities",
     "today", "yesterday", "tomorrow", "this", "that", "these", "those", "last", "next",
+    "now", "currently", "again", "instead", "maybe", "perhaps", "actually", "basically",
+    "simply", "okay", "ok", "alright", "sure", "yes", "yeah", "yep", "nope", "no",
+    "fine", "cool", "thanks", "thank", "hello", "hi", "hey", "please",
     "week", "weeks", "month", "months", "year", "years", "day", "days", "daily",
     "january", "february", "march", "april", "may", "june", "july", "august",
     "september", "october", "november", "december",
@@ -1005,7 +1008,17 @@ def enhance_for_sql(question, history=None, domain=None):
         notes.append(
             "IMPORTANT: This message asks MULTIPLE things at once. "
             "Return exactly ONE SELECT statement (no semicolons) that answers EVERY part. "
-            "Combine results using multiple columns, aggregates, CASE/SUM, and subqueries in the same query."
+            "Combine results using multiple columns, aggregates, CASE/SUM, and subqueries in the same query. "
+            "Do NOT answer only the first metric — every requested metric must appear as its own column."
+        )
+
+    requested_metrics = extract_requested_metric_order(question)
+    if len(requested_metrics) >= 2:
+        notes.append(
+            "REQUIRED METRICS (include ALL as separate output columns in one SELECT): "
+            + ", ".join(requested_metrics)
+            + ". Never omit any of these. If this is month-by-month, each month row must "
+            "contain every metric column."
         )
 
     if re.search(r"\b(average|avg|mean|total|sum|overall)\b", text, re.IGNORECASE):
@@ -1111,6 +1124,13 @@ def enhance_for_answer(question):
         base += (
             " If the data is month-by-month, use month NAMES (January, February, ...) "
             "and cover every month present in the data, not only the first few."
+        )
+    requested_metrics = extract_requested_metric_order(question)
+    if len(requested_metrics) >= 2:
+        base += (
+            " The user asked for multiple metrics ("
+            + ", ".join(requested_metrics)
+            + "). Mention ALL of them in your 1-2 sentences — do not cover only the first."
         )
     if exclusion_sql_guidance(question) or (
         is_continuation_followup(question)
@@ -2814,11 +2834,28 @@ def extract_name_hints(question):
 def looks_like_person_question(question):
     """
     Only run person lookup when the question actually seems to name someone.
-    Avoid treating words like "monthly" / "made" / "log" as people.
+    Avoid treating words like "monthly" / "made" / "log" / "now" as people.
     """
     text = question or ""
     if not text.strip():
         return False
+
+    # Discourse openers are never a person cue by themselves.
+    if re.match(
+        r"^\s*(now|okay|ok|alright|sure|please|then|also|and|plus)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        # Still allow "Now Akshay's hours..." if a real name follows.
+        remainder = re.sub(
+            r"^\s*(now|okay|ok|alright|sure|please|then|also|and|plus)\b[\s,:-]*",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if not extract_name_hints(remainder):
+            return False
+        text = remainder
 
     hints = extract_name_hints(question)
     if not hints:
@@ -2839,7 +2876,27 @@ def looks_like_person_question(question):
         return True
 
     if is_recruiter_question(question):
-        return True
+        # Only if hints survived stopwords and look like a real name cue.
+        if len(hints) >= 2:
+            return True
+        if len(hints) == 1 and hints[0][0].isupper():
+            # Avoid "Show"/"Now" style leftovers — require a person-like pattern.
+            if re.search(
+                rf"\b(?:did|for|about|regarding|candidate|employee|recruiter)\s+"
+                rf"{re.escape(hints[0])}\b",
+                question or "",
+                re.IGNORECASE,
+            ) or re.search(
+                rf"^\s*{re.escape(hints[0])}\b",
+                text,
+            ):
+                return True
+        if len(hints) >= 1 and re.search(
+            rf"\b(?:give\s+me|show\s+me|get\s+me|tell\s+me)\s+{re.escape(hints[0])}\b",
+            question or "",
+            re.IGNORECASE,
+        ):
+            return True
 
     if re.search(
         r"\bfor\s+(?:candidate\s+|employee\s+|recruiter\s+|user\s+)?[A-Za-z]",
@@ -3696,9 +3753,9 @@ def has_pronoun_person_followup(question):
 
 def is_continuation_followup(question):
     """
-    Follow-ups that should keep prior filters/SQL context:
-    "and avg logged hours", "excluding weekends", "what about this month",
-    "now exclude Fridays", "without Fridays too".
+    Follow-ups that should keep prior filters/SQL/person context:
+    "and avg logged hours", "excluding weekends", "now show me...",
+    "what about the other two".
     """
     text = (question or "").strip()
     if not text:
@@ -3706,8 +3763,14 @@ def is_continuation_followup(question):
     if is_comparison_question(text) or has_pronoun_person_followup(text):
         return True
     if re.match(
-        r"^\s*(and|also|plus|now|then|what\s+about|how\s+about|"
-        r"excluding|exclude|without|except)\b",
+        r"^\s*(and|also|plus|now|then|okay|ok|alright|sure|please|"
+        r"what\s+about|how\s+about|excluding|exclude|without|except)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return True
+    if re.search(
+        r"\b(what\s+about|how\s+about|the\s+other|as\s+well|too|also)\b",
         text,
         re.IGNORECASE,
     ):
@@ -3728,7 +3791,8 @@ def is_continuation_followup(question):
     # Metric-only follow-up with no new person name.
     if not extract_name_hints(text) and re.search(
         r"\b(avg|average|total|sum|excluding|exclude|weekend|weekday|"
-        r"logged\s*hours?|month\s+by\s+month|by\s+month)\b",
+        r"logged\s*hours?|month\s+by\s+month|by\s+month|break|information|"
+        r"same|those|that)\b",
         text,
         re.IGNORECASE,
     ):
@@ -4102,24 +4166,54 @@ def names_refer_to_same_person(hints, full_name):
     return True
 
 
+def missing_requested_metrics(question, results):
+    """Return metric aliases asked for but missing from the result columns."""
+    requested = extract_requested_metric_order(question)
+    if len(requested) < 2:
+        return []
+    if not results:
+        return list(requested)
+    present = set()
+    for key in results[0].keys():
+        bucket = _metric_bucket_for_column(key)
+        if bucket:
+            present.add(bucket)
+        if _norm_col(key) == "duration":
+            present.add("logged_hours")
+    return [metric for metric in requested if metric not in present]
+
+
+def infer_active_person(history=None, last_result=None, confirmed_username=None):
+    """Prefer explicit confirmation, else prior person from history/SQL."""
+    if confirmed_username:
+        return confirmed_username
+    if last_result and isinstance(last_result, dict):
+        from_sql = _extract_username_from_sql(str(last_result.get("query") or ""))
+        if from_sql:
+            return from_sql
+        mem = last_result.get("memory") if isinstance(last_result.get("memory"), dict) else {}
+        people = mem.get("people") if isinstance(mem.get("people"), list) else []
+        if people:
+            return str(people[0])
+    return _person_from_history_questions(history)
+
+
 def should_reuse_prior_person(question, confirmed_username=None, confirmed_employee_id=None):
     """
-    Keep a previously confirmed person only for pronoun follow-ups, comparisons,
-    or metric/filter continuations ("and avg", "excluding Fridays").
-    A newly named person replaces the old one.
+    Keep the active person across turns until the user names someone else.
     """
     if not (confirmed_username or confirmed_employee_id):
         return False
     if is_comparison_question(question):
         return True
-    if is_continuation_followup(question) and not extract_name_hints(question):
-        return True
     hints = extract_name_hints(question)
     if hints:
         if confirmed_username and names_refer_to_same_person(hints, confirmed_username):
             return True
+        # A different person was named — switch.
         return False
-    return has_pronoun_person_followup(question)
+    # No new person named → keep the current one.
+    return True
 
 
 def sanitize_history_for_question(question, history):
@@ -4549,11 +4643,22 @@ def ask_question():
             last_result = None
         history = add_result_context_to_history(history, last_result)
 
+        # Stick with the current person until a different person is named.
+        if not confirmed_username:
+            confirmed_username = infer_active_person(
+                history=history,
+                last_result=last_result,
+                confirmed_username=None,
+            )
+
         if not should_reuse_prior_person(
             question, confirmed_username, confirmed_employee_id
         ):
             confirmed_username = None
             confirmed_employee_id = None
+        elif confirmed_username and not extract_name_hints(question):
+            # Keep sticky person for follow-ups with no new name.
+            pass
 
         primary_table = schema_provider.get_primary_table_name()
         domain = detect_question_domain(question, history=history, last_result=last_result)
@@ -4712,6 +4817,36 @@ def ask_question():
             )
 
         raw_results = execute_sql(sql_query)
+        # If the user asked for several metrics but SQL only returned one, regenerate once.
+        missing = missing_requested_metrics(question, raw_results)
+        if missing and domain == "prohance":
+            retry_question = (
+                f"{question}\n\n"
+                f"CRITICAL RETRY: Previous SQL missed these metrics: {', '.join(missing)}. "
+                f"Return ONE SELECT that includes ALL of: "
+                f"{', '.join(extract_requested_metric_order(question))}."
+            )
+            retry_sql = generate_sql(
+                retry_question,
+                history,
+                primary_table,
+                confirmed_username,
+                confirmed_employee_id,
+                domain=domain,
+            )
+            retry_sql = clean_sql(retry_sql, primary_table or "EmployeeAttendance")
+            retry_sql = remove_broad_query_limit(retry_sql, question)
+            retry_sql = ensure_single_readonly_sql(retry_sql)
+            is_retry_valid, _ = validate_select_query(retry_sql)
+            if is_retry_valid and retry_sql.upper() != "NA":
+                try:
+                    retry_results = execute_sql(retry_sql)
+                    if not missing_requested_metrics(question, retry_results):
+                        sql_query = retry_sql
+                        raw_results = retry_results
+                except Exception:
+                    pass
+
         duration_hint = build_duration_answer_context(raw_results, question)
         results = enrich_duration_results(raw_results, question)
         candidates = get_candidates(results)
@@ -4729,6 +4864,9 @@ def ask_question():
                     "candidates": shortlist,
                     "data": [],
                     "chart_type": "table",
+                    "domain": domain,
+                    "confirmed_username": confirmed_username,
+                    "confirmed_employee_id": confirmed_employee_id,
                 }
             )
 
@@ -4738,6 +4876,12 @@ def ask_question():
             confirmed_username = (
                 _person_from_history_questions(history)
                 or _extract_username_from_sql(sql_query)
+            )
+        if not confirmed_username:
+            confirmed_username = infer_active_person(
+                history=history,
+                last_result={"query": sql_query},
+                confirmed_username=None,
             )
 
         answer, chart_type = generate_answer(
@@ -4759,6 +4903,8 @@ def ask_question():
                 "chart_type": chart_type,
                 "total_rows": len(results),
                 "domain": domain,
+                "confirmed_username": confirmed_username,
+                "confirmed_employee_id": confirmed_employee_id,
             }
         )
     except DATABASE_ERROR_TYPES as exc:

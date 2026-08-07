@@ -327,6 +327,13 @@
     let lastUserQuestion = "";
     let chartCounter = 0;
     let lastResultContext = null;
+    let activePerson = { username: null, employeeId: null };
+
+    const NAME_STOPWORDS = new Set([
+      "now", "okay", "ok", "alright", "sure", "please", "then", "also", "and", "plus",
+      "show", "list", "give", "tell", "get", "what", "who", "how", "when", "where",
+      "this", "that", "these", "those", "information", "data", "report", "summary"
+    ]);
 
     const CHART_COLORS = [
       "#19c37d", "#5436da", "#3b82f6", "#f59e0b", "#ef4444",
@@ -1055,20 +1062,30 @@
       // do not attach the previous person's result context unless comparing / continuing.
       const q = String(text || "");
       if (/\b(compare|versus|vs\.?|both|difference between)\b/i.test(q)) return false;
-      if (/^\s*(and|also|plus|now|then|what about|how about|excluding|exclude|without|except)\b/i.test(q)) return false;
+      if (/^\s*(and|also|plus|now|then|okay|ok|alright|sure|please|what about|how about|excluding|exclude|without|except)\b/i.test(q)) return false;
       if (/\b(exclud(?:e|ing|ed)|without|except|omit|remove|skip)\b/i.test(q)
           && /\b(weekend|weekends|weekday|weekdays|monday|tuesday|wednesday|thursday|friday|saturday|sunday)s?\b/i.test(q)) {
         return false;
       }
-      if (/\b(he|she|they|them|his|her|their|him|this user|same person)\b/i.test(q)) {
+      if (/\b(he|she|they|them|his|her|their|him|this user|same person|the other)\b/i.test(q)) {
         return false;
       }
+      // Leading discourse word that is not a person.
+      const leading = (q.match(/^\s*([A-Za-z][A-Za-z'.-]*)/) || [])[1];
+      if (leading && NAME_STOPWORDS.has(leading.toLowerCase())) return false;
+
       // Leading name: "Disha how many..." / "Akshay Soni, ..."
       if (/^\s*[A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,2}\s*[,:]?\s+(how|what|who|show|list|give|tell|did|for)\b/i.test(q)) {
+        const leadName = (q.match(/^\s*([A-Za-z][A-Za-z'.-]*)/) || [])[1];
+        if (leadName && NAME_STOPWORDS.has(leadName.toLowerCase())) return false;
         return true;
       }
       if (/\b(for|did|about)\s+[A-Z][a-zA-Z'.-]+/.test(q)) return true;
-      if (/^\s*(give|show|get|tell)\s+me\s+[A-Z][a-zA-Z'.-]+/i.test(q)) return true;
+      if (/^\s*(give|show|get|tell)\s+me\s+[A-Z][a-zA-Z'.-]+/i.test(q)) {
+        const afterMe = (q.match(/^\s*(?:give|show|get|tell)\s+me\s+([A-Za-z][A-Za-z'.-]*)/i) || [])[1];
+        if (afterMe && NAME_STOPWORDS.has(afterMe.toLowerCase())) return false;
+        return true;
+      }
       return false;
     }
 
@@ -1087,11 +1104,14 @@
         // New named person → drop prior result memory so old filters are not reused.
         if (looksLikeNewPersonQuestion(text)) {
           lastResultContext = null;
+          activePerson = { username: null, employeeId: null };
         } else if (lastResultContext) {
           payload.last_result = lastResultContext;
         }
-        if (confirmedUsername) payload.confirmed_username = confirmedUsername;
-        if (confirmedEmployeeId) payload.confirmed_employee_id = String(confirmedEmployeeId);
+        const personName = confirmedUsername || activePerson.username;
+        const personId = confirmedEmployeeId || activePerson.employeeId;
+        if (personName) payload.confirmed_username = personName;
+        if (personId) payload.confirmed_employee_id = String(personId);
 
         const res = await fetch(`${base}/api/AskQuestion`, {
           method: "POST",
@@ -1104,6 +1124,15 @@
         if (data.error && !data.answer) {
           addBot(friendlyError(data));
           return;
+        }
+
+        // Stick with this person for later questions until a new one is named.
+        if (data.confirmed_username) {
+          activePerson.username = data.confirmed_username;
+          activePerson.employeeId = data.confirmed_employee_id || activePerson.employeeId;
+        } else if (data.candidates && data.candidates.length === 1 && data.candidates[0].username) {
+          activePerson.username = data.candidates[0].username;
+          activePerson.employeeId = data.candidates[0].employee_id || null;
         }
 
         if (data.error && data.answer) {
@@ -1142,6 +1171,7 @@
 
     async function confirmEmployee(originalQuestion, username, employeeId) {
       const label = employeeId ? `${username} (ID: ${employeeId})` : username;
+      activePerson = { username, employeeId: employeeId || null };
       addUser(`Yes, ${label}`);
       await sendQuestion(originalQuestion, username, employeeId);
     }
